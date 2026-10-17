@@ -1,0 +1,264 @@
+#%RAML 1.0
+title: Shipping System API
+version: v1
+baseUri: http://localhost:8083/api/v1
+mediaType: application/json
+
+types:
+  ShippingAddress:
+    type: object
+    properties:
+      addressLine1:
+        type: string
+        required: true
+        example: "21 Anna Salai"
+      city:
+        type: string
+        required: true
+        example: "Chennai"
+      state:
+        type: string
+        required: true
+        example: "Tamil Nadu"
+      postalCode:
+        type: string
+        required: true
+        example: "600002"
+      country:
+        type: string
+        required: true
+        example: "India"
+
+  ServiceLevel:
+    type: string
+    enum: [STANDARD, EXPRESS]
+    default: STANDARD
+
+  DispatchRequest:
+    type: object
+    properties:
+      correlationId:
+        type: string
+        required: true
+        example: "6e0a9c34-71bd-4e28-b9f5-3c7188a0e412"
+      sagaId:
+        type: string
+        required: true
+        example: "SAGA-2026-0000771"
+      stepId:
+        type: string
+        required: true
+        example: "SAGA-2026-0000771-STEP-3"
+      stepName:
+        type: string
+        required: false
+        default: "DISPATCH_SHIPPING"
+      commandType:
+        type: string
+        required: false
+        default: "DISPATCH"
+      attempt:
+        type: integer
+        required: false
+        default: 1
+      orderId:
+        type: string
+        required: true
+        example: "ORD-2026-1001"
+      shippingAddress:
+        type: ShippingAddress
+        required: true
+      serviceLevel:
+        type: ServiceLevel
+        required: false
+        default: STANDARD
+
+  DispatchResult:
+    type: object
+    properties:
+      shippingId: string
+      orderId: string
+      trackingNumber: string
+      serviceLevel: string
+      status: string
+
+  DispatchResponse:
+    type: object
+    properties:
+      correlationId: string
+      sagaId: string
+      stepId: string
+      stepName: string
+      attempt: integer
+      outcome:
+        type: string
+        enum: [SUCCESS, FAILURE]
+      completedAt: string
+      result?: DispatchResult
+      failureType?: string
+      failureCode?: string
+      failureMessage?: string
+      retryable?: boolean
+
+  CancelRequest:
+    type: object
+    properties:
+      correlationId:
+        type: string
+        required: true
+        example: "6e0a9c34-71bd-4e28-b9f5-3c7188a0e412"
+      sagaId:
+        type: string
+        required: true
+        example: "SAGA-2026-0000771"
+      stepId:
+        type: string
+        required: true
+        example: "SAGA-2026-0000771-STEP-3"
+      stepName:
+        type: string
+        required: false
+        default: "CANCEL_SHIPPING"
+      commandType:
+        type: string
+        required: false
+        default: "CANCEL"
+      attempt:
+        type: integer
+        required: false
+        default: 1
+      shippingId:
+        type: string
+        required: false
+        example: "SHP-88219430"
+      orderId:
+        type: string
+        required: false
+        example: "ORD-2026-1001"
+      reason:
+        type: string
+        required: false
+        default: "SAGA_COMPENSATION"
+
+  CancelResult:
+    type: object
+    properties:
+      shippingId: string
+      orderId: string
+      trackingNumber: string
+      status: string
+
+  CancelResponse:
+    type: object
+    properties:
+      correlationId: string
+      sagaId: string
+      stepId: string
+      stepName: string
+      attempt: integer
+      outcome:
+        type: string
+        enum: [SUCCESS, FAILURE]
+      completedAt: string
+      result?: CancelResult
+      failureType?: string
+      failureCode?: string
+      failureMessage?: string
+      retryable?: boolean
+
+  ErrorResponse:
+    type: object
+    properties:
+      correlationId: string
+      outcome: string
+      failureType: string
+      failureCode: string
+      failureMessage: string
+      retryable: boolean
+
+/shipping:
+  /dispatch:
+    post:
+      displayName: Dispatch Shipping (Saga Step 3)
+      description: Initiates shipment and allocates tracking number idempotently.
+      body:
+        application/json:
+          type: DispatchRequest
+          example:
+            correlationId: "6e0a9c34-71bd-4e28-b9f5-3c7188a0e412"
+            sagaId: "SAGA-2026-0000771"
+            stepId: "SAGA-2026-0000771-STEP-3"
+            stepName: "DISPATCH_SHIPPING"
+            commandType: "DISPATCH"
+            attempt: 1
+            orderId: "ORD-2026-1001"
+            shippingAddress:
+              addressLine1: "21 Anna Salai"
+              city: "Chennai"
+              state: "Tamil Nadu"
+              postalCode: "600002"
+              country: "India"
+            serviceLevel: "STANDARD"
+      responses:
+        200:
+          body:
+            application/json:
+              type: DispatchResponse
+        400:
+          body:
+            application/json:
+              type: ErrorResponse
+        409:
+          body:
+            application/json:
+              type: DispatchResponse
+        500:
+          body:
+            application/json:
+              type: ErrorResponse
+        503:
+          body:
+            application/json:
+              type: ErrorResponse
+
+  /cancel:
+    post:
+      displayName: Cancel Shipping (Saga Step 3 Compensation)
+      description: Cancels a previously created shipping dispatch.
+      body:
+        application/json:
+          type: CancelRequest
+          example:
+            correlationId: "6e0a9c34-71bd-4e28-b9f5-3c7188a0e412"
+            sagaId: "SAGA-2026-0000771"
+            stepId: "SAGA-2026-0000771-STEP-3"
+            stepName: "CANCEL_SHIPPING"
+            commandType: "CANCEL"
+            attempt: 1
+            orderId: "ORD-2026-1001"
+            reason: "SAGA_COMPENSATION"
+      responses:
+        200:
+          body:
+            application/json:
+              type: CancelResponse
+        400:
+          body:
+            application/json:
+              type: ErrorResponse
+        404:
+          body:
+            application/json:
+              type: CancelResponse
+        409:
+          body:
+            application/json:
+              type: CancelResponse
+        500:
+          body:
+            application/json:
+              type: ErrorResponse
+        503:
+          body:
+            application/json:
+              type: ErrorResponse

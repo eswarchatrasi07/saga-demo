@@ -1,0 +1,74 @@
+#%RAML 1.0
+title: Payment System API
+version: v1
+baseUri: http://localhost:8082/api/v1
+mediaType: application/json
+
+types:
+  ChargeRequest:
+    type: object
+    properties:
+      correlationId: string
+      sagaId: string
+      stepId: string
+      stepName?: string
+      attempt?: integer
+      orderId: string
+      amount: number
+      currency?: string
+      cardToken: string
+
+  RefundRequest:
+    type: object
+    properties:
+      correlationId: string
+      sagaId: string
+      stepId: string
+      stepName?: string
+      attempt?: integer
+      paymentId?: string
+      orderId?: string
+
+/payments:
+  /charge:
+    post:
+      displayName: Charge Payment
+      body:
+        application/json:
+          type: ChargeRequest
+      responses:
+        200:
+          body:
+            application/json:
+        400:
+          body:
+            application/json:
+        409:
+          body:
+            application/json:
+        500:
+          body:
+            application/json:
+
+  /refund:
+    post:
+      displayName: Refund Payment
+      body:
+        application/json:
+          type: RefundRequest
+      responses:
+        200:
+          body:
+            application/json:
+        400:
+          body:
+            application/json:
+        404:
+          body:
+            application/json:
+        409:
+          body:
+            application/json:
+        500:
+          body:
+            application/json:

@@ -1,0 +1,209 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="
+		http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!-- Application-wide default error handler binding -->
+	<configuration defaultErrorHandler-ref="global-error-handler" />
+
+	<!-- ===================================================================== -->
+	<!-- GLOBAL ERROR HANDLER                                                 -->
+	<!-- Reusable across Inventory, Payment, and Shipping System APIs          -->
+	<!-- ===================================================================== -->
+	<error-handler name="global-error-handler">
+
+		<!-- 1. APIKit Router Errors (Standard Module Errors) -->
+		<on-error-propagate type="APIKIT:BAD_REQUEST" logException="true">
+			<set-variable variableName="httpStatus" value="400" doc:name="Set Status 400" />
+			<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Prepare Error Response" />
+		</on-error-propagate>
+
+		<on-error-propagate type="APIKIT:NOT_FOUND" logException="true">
+			<set-variable variableName="httpStatus" value="404" doc:name="Set Status 404" />
+			<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Prepare Error Response" />
+		</on-error-propagate>
+
+		<on-error-propagate type="APIKIT:METHOD_NOT_ALLOWED" logException="true">
+			<set-variable variableName="httpStatus" value="405" doc:name="Set Status 405" />
+			<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Prepare Error Response" />
+		</on-error-propagate>
+
+		<on-error-propagate type="APIKIT:NOT_ACCEPTABLE" logException="true">
+			<set-variable variableName="httpStatus" value="406" doc:name="Set Status 406" />
+			<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Prepare Error Response" />
+		</on-error-propagate>
+
+		<on-error-propagate type="APIKIT:UNSUPPORTED_MEDIA_TYPE" logException="true">
+			<set-variable variableName="httpStatus" value="415" doc:name="Set Status 415" />
+			<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Prepare Error Response" />
+		</on-error-propagate>
+
+		<on-error-propagate type="APIKIT:NOT_IMPLEMENTED" logException="true">
+			<set-variable variableName="httpStatus" value="501" doc:name="Set Status 501" />
+			<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Prepare Error Response" />
+		</on-error-propagate>
+
+		<!-- 2. Transient Technical Errors (Database Connectivity, Retry Exhausted) -->
+		<on-error-propagate type="DB:CONNECTIVITY, DB:RETRY_EXHAUSTED, CONNECTIVITY" logException="true">
+			<set-variable variableName="httpStatus" value="503" doc:name="Set Status 503" />
+			<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Prepare Error Response" />
+		</on-error-propagate>
+
+		<!-- 3. Non-Transient Database Errors (SQL Syntax, Query Execution Constraints) -->
+		<on-error-propagate type="DB:BAD_SQL_SYNTAX, DB:QUERY_EXECUTION" logException="true">
+			<set-variable variableName="httpStatus" value="500" doc:name="Set Status 500" />
+			<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Prepare Error Response" />
+		</on-error-propagate>
+
+		<!-- 4. Business Errors & Catch-All (Classified Dynamically in Sub-flow) -->
+		<on-error-propagate type="ANY" logException="true">
+			<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Prepare Error Response" />
+		</on-error-propagate>
+
+	</error-handler>
+
+	<!-- ===================================================================== -->
+	<!-- REUSABLE SUB-FLOW: PREPARE ERROR RESPONSE & SAFE AUDIT LOGGING        -->
+	<!-- ===================================================================== -->
+	<sub-flow name="global-prepare-error-response-sub-flow">
+		<ee:transform doc:name="Format Standardized Saga Error Payload">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+
+// 1. Resolve Correlation and Business Identifiers safely
+var resolvedCorrelationId = vars.request.correlationId default vars.command.correlationId default correlationId
+var resolvedSagaId = vars.request.sagaId default vars.command.sagaId default null
+var resolvedStepId = vars.request.stepId default vars.command.stepId default null
+var resolvedStepName = vars.request.stepName default vars.command.stepName default (
+    if (!isEmpty(vars.requestedSku default '')) 'GET_STOCK'
+    else 'UNKNOWN_STEP'
+)
+var resolvedAttempt = vars.request.attempt default vars.command.attempt default 1
+
+// 2. Classify Failure Type
+var errorNamespace = error.errorType.namespace default ''
+var errorIdentifier = error.errorType.identifier default ''
+var isBusiness = (
+    (['INVENTORY', 'PAYMENT', 'SHIPPING', 'APIKIT'] contains errorNamespace) or
+    (['UNKNOWN_SKU', 'RESERVATION_NOT_FOUND', 'INSUFFICIENT_STOCK', 'COMMAND_IN_PROGRESS',
+      'INVALID_COMMAND', 'INVALID_ITEM', 'INVALID_ITEMS', 'INVALID_REQUEST', 'INVALID_QUANTITY',
+      'PAYMENT_DECLINED', 'PAYMENT_NOT_FOUND', 'INVALID_PAYMENT_STATE',
+      'SHIPPING_DECLINED', 'SERVICE_UNAVAILABLE', 'SHIPPING_NOT_FOUND', 'INVALID_SHIPPING_STATE',
+      'STOCK_RESTORE_FAILED', 'RESERVATION_UPDATE_FAILED', 'INVALID_RESERVATION_STATE'] contains errorIdentifier)
+)
+var failureType = if (isBusiness) 'BUSINESS' else 'TECHNICAL'
+
+// 3. Determine Retryability (Only transient technical failures are retryable)
+var isRetryable = (
+    (errorNamespace == 'DB' and (['CONNECTIVITY', 'RETRY_EXHAUSTED'] contains errorIdentifier)) or
+    errorIdentifier == 'CONNECTIVITY' or
+    errorNamespace == 'CONNECTIVITY'
+)
+
+// 4. Determine Standard Failure Code
+var failureCode = if (errorNamespace == 'APIKIT') (
+    if (errorIdentifier == 'BAD_REQUEST') 'INVALID_REQUEST'
+    else if (errorIdentifier == 'NOT_FOUND') 'RESOURCE_NOT_FOUND'
+    else if (errorIdentifier == 'METHOD_NOT_ALLOWED') 'METHOD_NOT_ALLOWED'
+    else if (errorIdentifier == 'NOT_ACCEPTABLE') 'NOT_ACCEPTABLE'
+    else if (errorIdentifier == 'UNSUPPORTED_MEDIA_TYPE') 'UNSUPPORTED_MEDIA_TYPE'
+    else if (errorIdentifier == 'NOT_IMPLEMENTED') 'NOT_IMPLEMENTED'
+    else errorIdentifier
+) else if (isRetryable) (
+    if (errorIdentifier == 'RETRY_EXHAUSTED') 'RETRY_EXHAUSTED'
+    else 'CONNECTIVITY_ERROR'
+) else (
+    errorIdentifier default 'INTERNAL_ERROR'
+)
+
+// 5. Sanitize Failure Message (Never leak SQL syntax, passwords, or card tokens)
+var rawDescription = error.description default 'An error occurred during transaction processing'
+var failureMessage = if (isRetryable)
+    'Transient connectivity failure to database or external service'
+else if (errorNamespace == 'DB' and !isBusiness)
+    'A database processing error occurred'
+else if (errorNamespace == 'APIKIT') (
+    if (errorIdentifier == 'BAD_REQUEST') 'Malformed JSON request or schema validation constraint violated'
+    else if (errorIdentifier == 'NOT_FOUND') 'Requested API resource not found'
+    else if (errorIdentifier == 'METHOD_NOT_ALLOWED') 'HTTP method not allowed for requested endpoint'
+    else if (errorIdentifier == 'NOT_ACCEPTABLE') 'HTTP accept header not acceptable'
+    else if (errorIdentifier == 'UNSUPPORTED_MEDIA_TYPE') 'Unsupported media type in Content-Type header'
+    else if (errorIdentifier == 'NOT_IMPLEMENTED') 'Feature not implemented'
+    else rawDescription
+) else
+    rawDescription
+
+---
+{
+    correlationId: resolvedCorrelationId,
+    sagaId: resolvedSagaId,
+    stepId: resolvedStepId,
+    stepName: resolvedStepName,
+    attempt: resolvedAttempt,
+    outcome: 'FAILURE',
+    completedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"},
+    failureType: failureType,
+    failureCode: failureCode,
+    failureMessage: failureMessage,
+    retryable: isRetryable
+}]]></ee:set-payload>
+			</ee:message>
+			<ee:variables>
+				<ee:set-variable variableName="httpStatus"><![CDATA[%dw 2.0
+output application/java
+var errorNamespace = error.errorType.namespace default ''
+var errorIdentifier = error.errorType.identifier default ''
+var isRetryable = (
+    (errorNamespace == 'DB' and (['CONNECTIVITY', 'RETRY_EXHAUSTED'] contains errorIdentifier)) or
+    errorIdentifier == 'CONNECTIVITY' or
+    errorNamespace == 'CONNECTIVITY'
+)
+---
+if (vars.httpStatus != null) vars.httpStatus as Number
+else if (['UNKNOWN_SKU', 'RESERVATION_NOT_FOUND', 'PAYMENT_NOT_FOUND', 'SHIPPING_NOT_FOUND'] contains errorIdentifier) 404
+else if (['INVALID_COMMAND', 'INVALID_ITEM', 'INVALID_ITEMS', 'INVALID_REQUEST', 'INVALID_QUANTITY'] contains errorIdentifier) 400
+else if (['INSUFFICIENT_STOCK', 'COMMAND_IN_PROGRESS', 'PAYMENT_DECLINED', 'INVALID_PAYMENT_STATE',
+          'STOCK_RESTORE_FAILED', 'RESERVATION_UPDATE_FAILED', 'INVALID_RESERVATION_STATE',
+          'SHIPPING_DECLINED', 'SERVICE_UNAVAILABLE', 'INVALID_SHIPPING_STATE'] contains errorIdentifier) 409
+else if (isRetryable) 503
+else if (errorIdentifier == 'NOT_FOUND') 404
+else if (errorIdentifier == 'BAD_REQUEST') 400
+else if (errorIdentifier == 'METHOD_NOT_ALLOWED') 405
+else if (errorIdentifier == 'NOT_ACCEPTABLE') 406
+else if (errorIdentifier == 'UNSUPPORTED_MEDIA_TYPE') 415
+else if (errorIdentifier == 'NOT_IMPLEMENTED') 501
+else 500]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+
+		<!-- Standardized Safe Audit Logger: No Card Tokens or Credentials -->
+		<logger level="ERROR" doc:name="Safe Audit Log Event"
+			message="#[%dw 2.0
+output application/json
+---
+{
+    logEvent: 'SAGA_STEP_ERROR',
+    timestamp: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
+    correlationId: payload.correlationId,
+    sagaId: payload.sagaId,
+    stepId: payload.stepId,
+    stepName: payload.stepName,
+    attempt: payload.attempt,
+    outcome: payload.outcome,
+    failureType: payload.failureType,
+    failureCode: payload.failureCode,
+    failureMessage: payload.failureMessage,
+    retryable: payload.retryable,
+    httpStatus: vars.httpStatus,
+    errorType: (error.errorType.namespace default '') ++ ':' ++ (error.errorType.identifier default '')
+}]" />
+	</sub-flow>
+
+</mule>

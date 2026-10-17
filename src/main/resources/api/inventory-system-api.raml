@@ -1,0 +1,318 @@
+#%RAML 1.0
+title: Inventory System API
+version: v1
+baseUri: http://localhost:8081/api
+mediaType: application/json
+protocols: [ HTTP ]
+
+documentation:
+  - title: Overview
+    content: |
+      Manages SKU stock and inventory reservations for the Saga Orchestrator.
+      Each reservation command is idempotent by sagaId + stepId + command type.
+
+types:
+  SagaContext:
+    type: object
+    properties:
+      correlationId: string
+      sagaId: string
+      stepId: string
+      stepName?: string
+      attempt?:
+        type: integer
+        minimum: 1
+
+  InventoryItem:
+    type: object
+    properties:
+      sku:
+        type: string
+        minLength: 1
+      quantity:
+        type: integer
+        minimum: 1
+
+  ReserveRequest:
+    type: SagaContext
+    properties:
+      orderId:
+        type: string
+        minLength: 1
+      items:
+        type: array
+        minItems: 1
+        items: InventoryItem
+    example:
+      correlationId: 6e0a9c34-71bd-4e28-b9f5-3c7188a0e412
+      sagaId: SAGA-2026-0000771
+      stepId: SAGA-2026-0000771-STEP-1
+      stepName: RESERVE_INVENTORY
+      attempt: 1
+      orderId: ORD-2026-1001
+      items:
+        - sku: SKU-TSHIRT-BLK-M
+          quantity: 2
+        - sku: SKU-SHOE-BRN-42
+          quantity: 1
+
+  ReleaseRequest:
+    type: SagaContext
+    properties:
+      reservationId:
+        type: string
+        minLength: 1
+      orderId?: string
+      reason?: string
+    example:
+      correlationId: 6e0a9c34-71bd-4e28-b9f5-3c7188a0e412
+      sagaId: SAGA-2026-0000771
+      stepId: SAGA-2026-0000771-COMP-1
+      stepName: RELEASE_INVENTORY
+      attempt: 1
+      reservationId: RSV-2026-558102
+      orderId: ORD-2026-1001
+      reason: SAGA_COMPENSATION
+
+  InventoryResult:
+    type: object
+    properties:
+      reservationId: string
+      reservationStatus?:
+        type: string
+        enum: [ RESERVED, RELEASED ]
+
+  InventorySuccessReply:
+    type: SagaContext
+    properties:
+      outcome:
+        type: string
+        enum: [ SUCCESS ]
+      completedAt: datetime
+      result: InventoryResult
+
+  FailureReply:
+    type: object
+    properties:
+      correlationId?: string | nil
+      sagaId?: string | nil
+      stepId?: string | nil
+      stepName?: string
+      attempt?: integer
+      outcome?:
+        type: string
+        enum: [ FAILURE ]
+      completedAt?: datetime
+      failureType?:
+        type: string
+        enum: [ BUSINESS, TECHNICAL ]
+      failureCode?: string
+      failureMessage?: string
+      retryable?: boolean
+      errorCode?: string
+      message?: string
+
+  StockRecord:
+    type: object
+    properties:
+      sku: string
+      product_name: string
+      available_quantity: integer
+      reserved_quantity: integer
+      updated_at?: datetime | nil
+
+  StockNotFound:
+    type: object
+    properties:
+      errorCode:
+        type: string
+        enum: [ SKU_NOT_FOUND ]
+      sku: string
+      message: string
+
+/reserve:
+  post:
+    description: Reserve stock for every requested SKU as one local transaction. A failure for any item rolls back all stock updates in this reservation.
+    body:
+      application/json:
+        type: ReserveRequest
+    responses:
+      200:
+        description: Inventory reserved successfully.
+        body:
+          application/json:
+            type: InventorySuccessReply
+            example:
+              correlationId: 6e0a9c34-71bd-4e28-b9f5-3c7188a0e412
+              sagaId: SAGA-2026-0000771
+              stepId: SAGA-2026-0000771-STEP-1
+              stepName: RESERVE_INVENTORY
+              attempt: 1
+              outcome: SUCCESS
+              completedAt: "2026-10-14T10:00:00+05:30"
+              result:
+                reservationId: RSV-2026-558102
+      400:
+        description: Invalid command, empty items, invalid SKU field, or invalid quantity.
+        body:
+          application/json:
+            type: FailureReply
+            example:
+              correlationId: 6e0a9c34-71bd-4e28-b9f5-3c7188a0e412
+              sagaId: SAGA-2026-0000771
+              stepId: SAGA-2026-0000771-STEP-1
+              stepName: RESERVE_INVENTORY
+              outcome: FAILURE
+              failureCode: INVALID_ITEM
+              failureMessage: Each item must contain a non-empty sku and a positive whole-number quantity
+              retryable: false
+      404:
+        description: One or more requested SKUs do not exist.
+        body:
+          application/json:
+            type: FailureReply
+            example:
+              outcome: FAILURE
+              failureCode: UNKNOWN_SKU
+              failureMessage: Unknown SKU SKU-DOES-NOT-EXIST
+              retryable: false
+      409:
+        description: Insufficient stock or an identical command is still processing.
+        body:
+          application/json:
+            type: FailureReply
+            example:
+              outcome: FAILURE
+              failureCode: INSUFFICIENT_STOCK
+              failureMessage: Insufficient stock for SKU SKU-TSHIRT-BLK-M
+              retryable: false
+      503:
+        description: Retryable technical failure.
+        body:
+          application/json:
+            type: FailureReply
+            example:
+              outcome: FAILURE
+              failureType: TECHNICAL
+              failureCode: DATABASE_UNAVAILABLE
+              failureMessage: Inventory database is temporarily unavailable
+              retryable: true
+      500:
+        description: Unexpected Inventory API error.
+        body:
+          application/json:
+            type: FailureReply
+            example:
+              errorCode: INVENTORY_API_ERROR
+              message: Inventory API request failed
+
+/release:
+  post:
+    description: Compensate an earlier successful reservation. This operation must be idempotent and must not restore stock twice.
+    body:
+      application/json:
+        type: ReleaseRequest
+    responses:
+      200:
+        description: Reservation released or already released idempotently.
+        body:
+          application/json:
+            type: InventorySuccessReply
+            example:
+              correlationId: 6e0a9c34-71bd-4e28-b9f5-3c7188a0e412
+              sagaId: SAGA-2026-0000771
+              stepId: SAGA-2026-0000771-COMP-1
+              stepName: RELEASE_INVENTORY
+              attempt: 1
+              outcome: SUCCESS
+              completedAt: "2026-10-14T10:01:00+05:30"
+              result:
+                reservationId: RSV-2026-558102
+                reservationStatus: RELEASED
+      400:
+        description: Missing required release command identity or reservationId.
+        body:
+          application/json:
+            type: FailureReply
+            example:
+              outcome: FAILURE
+              failureCode: INVALID_COMMAND
+              failureMessage: Release command must include correlationId, sagaId, stepId and reservationId
+              retryable: false
+      404:
+        description: Reservation does not exist for the supplied saga and reservation ID.
+        body:
+          application/json:
+            type: FailureReply
+            example:
+              outcome: FAILURE
+              failureCode: RESERVATION_NOT_FOUND
+              failureMessage: No reservation found for this saga and reservation ID
+              retryable: false
+      409:
+        description: Command is in progress or reservation is not in a compensatable state.
+        body:
+          application/json:
+            type: FailureReply
+            example:
+              outcome: FAILURE
+              failureCode: INVALID_RESERVATION_STATE
+              failureMessage: Reservation is not in a compensatable state
+              retryable: false
+      503:
+        description: Retryable technical failure during compensation.
+        body:
+          application/json:
+            type: FailureReply
+            example:
+              outcome: FAILURE
+              failureType: TECHNICAL
+              failureCode: STOCK_RESTORE_FAILED
+              failureMessage: Unable to safely restore reserved stock
+              retryable: true
+      500:
+        description: Unexpected Inventory API error.
+        body:
+          application/json:
+            type: FailureReply
+            example:
+              errorCode: INVENTORY_API_ERROR
+              message: Inventory API request failed
+
+/stock/{sku}:
+  uriParameters:
+    sku:
+      type: string
+      minLength: 1
+      description: Unique stock-keeping unit.
+  get:
+    description: Read stock levels for a single SKU.
+    responses:
+      200:
+        description: Stock record found.
+        body:
+          application/json:
+            type: StockRecord
+            example:
+              sku: SKU-TSHIRT-BLK-M
+              product_name: Black T-Shirt Medium
+              available_quantity: 25
+              reserved_quantity: 3
+              updated_at: "2026-10-14T10:00:00+05:30"
+      404:
+        description: No inventory stock record exists for this SKU.
+        body:
+          application/json:
+            type: StockNotFound
+            example:
+              errorCode: SKU_NOT_FOUND
+              sku: SKU-DOES-NOT-EXIST
+              message: No inventory stock record exists for this SKU
+      500:
+        description: Inventory query failed.
+        body:
+          application/json:
+            type: FailureReply
+            example:
+              errorCode: INVENTORY_QUERY_FAILED
+              message: Unable to query inventory

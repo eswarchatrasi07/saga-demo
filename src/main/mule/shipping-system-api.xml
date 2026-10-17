@@ -1,0 +1,480 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+	xmlns:db="http://www.mulesoft.org/schema/mule/db"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="
+		http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+		http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+		http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd">
+
+	<!-- ==================== GLOBAL CONFIGURATIONS ==================== -->
+	<!-- 1. Properties file loaded first -->
+	<configuration-properties doc:name="Configuration properties" file="config.yaml" />
+
+	<!-- 2. HTTP Listener Config on Port 8083 -->
+	<http:listener-config name="shipping-system-api-httpListenerConfig">
+		<http:listener-connection host="0.0.0.0" port="8083" />
+	</http:listener-config>
+
+	<!-- 3. APIKit Router Config -->
+	<apikit:config name="shipping-system-api-config"
+		api="shipping-system-api.raml"
+		outboundHeadersMapName="outboundHeaders"
+		httpStatusVarName="httpStatus" />
+
+	<!-- 4. Database Config for Shipping Service (Aiven MySQL) with Bounded Reconnection -->
+	<db:config name="shipping_Database_Config" doc:name="Database Config">
+		<db:my-sql-connection host="${db.host}" port="${db.port}" user="${db.user}" password="${db.password}" database="${database.shipping}">
+			<reconnection>
+				<reconnect count="3" frequency="2000" />
+			</reconnection>
+		</db:my-sql-connection>
+	</db:config>
+
+	<!-- ==================== MAIN ROUTER FLOW ==================== -->
+	<flow name="shipping-system-api-main">
+		<http:listener config-ref="shipping-system-api-httpListenerConfig" path="/api/v1/*">
+			<http:response statusCode="#[vars.httpStatus default 200]">
+				<http:headers>#[vars.outboundHeaders default {}]</http:headers>
+			</http:response>
+			<http:error-response statusCode="#[vars.httpStatus default 500]">
+				<http:body>#[payload]</http:body>
+				<http:headers>#[vars.outboundHeaders default {}]</http:headers>
+			</http:error-response>
+		</http:listener>
+
+		<apikit:router config-ref="shipping-system-api-config" />
+
+		<!-- Centralized Error Handler replaces duplicate APIKit error handler -->
+		<error-handler ref="global-error-handler" />
+	</flow>
+
+	<!-- ==================== POST /shipping/dispatch (SAGA STEP 3) ==================== -->
+	<flow name="post:\shipping\dispatch:application\json:shipping-system-api-config">
+		<set-variable variableName="request" value="#[output application/java --- if (payload is String or payload is Binary) read(payload, 'application/json') else payload]" doc:name="Save dispatch request" />
+
+		<choice doc:name="Validate Dispatch Payload">
+			<when expression="#[
+				isEmpty(vars.request.correlationId default '') or
+				isEmpty(vars.request.sagaId default '') or
+				isEmpty(vars.request.stepId default '') or
+				isEmpty(vars.request.orderId default '') or
+				isEmpty(vars.request.shippingAddress.addressLine1 default '') or
+				isEmpty(vars.request.shippingAddress.city default '') or
+				isEmpty(vars.request.shippingAddress.postalCode default '') or
+				isEmpty(vars.request.shippingAddress.country default '')
+			]">
+				<set-variable variableName="httpStatus" value="400" doc:name="Status 400" />
+				<set-payload value="#[output application/java ---
+{
+	correlationId: vars.request.correlationId default null,
+	sagaId: vars.request.sagaId default null,
+	stepId: vars.request.stepId default null,
+	stepName: 'DISPATCH_SHIPPING',
+	attempt: vars.request.attempt default 1,
+	outcome: 'FAILURE',
+	completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
+	failureType: 'BUSINESS',
+	failureCode: 'INVALID_REQUEST',
+	failureMessage: 'correlationId, sagaId, stepId, orderId, and valid shippingAddress fields are required',
+	retryable: false
+}]" doc:name="Invalid Request Payload" />
+			</when>
+			<otherwise>
+				<set-variable variableName="command" value="#[output application/java ---
+{
+	correlationId: vars.request.correlationId,
+	sagaId: vars.request.sagaId,
+	stepId: vars.request.stepId,
+	stepName: vars.request.stepName default 'DISPATCH_SHIPPING',
+	commandType: vars.request.commandType default 'DISPATCH',
+	attempt: vars.request.attempt default 1,
+	payload: {
+		orderId: vars.request.orderId,
+		addressLine1: vars.request.shippingAddress.addressLine1,
+		city: vars.request.shippingAddress.city,
+		state: vars.request.shippingAddress.state default '',
+		postalCode: vars.request.shippingAddress.postalCode,
+		country: vars.request.shippingAddress.country,
+		serviceLevel: upper(vars.request.serviceLevel default 'STANDARD')
+	}
+}]" doc:name="Build Dispatch Command" />
+
+				<set-variable variableName="dedupKey" value="#[(vars.command.sagaId as String) ++ ':' ++ (vars.command.stepId as String) ++ ':DISPATCH']" doc:name="Set dedupKey" />
+
+				<flow-ref doc:name="Invoke Dispatch Sub-Flow" name="shipping-dispatch-Sub_Flow" />
+
+				<set-variable variableName="httpStatus" value="#[
+					if (payload.outcome == 'SUCCESS') 200
+					else if (payload.failureCode == 'SHIPPING_DECLINED' or payload.failureCode == 'SERVICE_UNAVAILABLE' or payload.failureCode == 'COMMAND_IN_PROGRESS') 409
+					else if (payload.retryable default false) 503
+					else 400
+				]" doc:name="Set httpStatus" />
+			</otherwise>
+		</choice>
+
+		<ee:transform doc:name="Reply to JSON">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+
+		<error-handler>
+			<on-error-continue type="ANY" logException="true">
+				<flow-ref name="shipping-handle-duplicate-race-sub-flow" doc:name="Handle Shipping Duplicate Race or Delegate" />
+			</on-error-continue>
+		</error-handler>
+	</flow>
+
+	<!-- ==================== POST /shipping/cancel (SAGA STEP 3 COMPENSATION) ==================== -->
+	<flow name="post:\shipping\cancel:application\json:shipping-system-api-config">
+		<set-variable variableName="request" value="#[output application/java --- if (payload is String or payload is Binary) read(payload, 'application/json') else payload]" doc:name="Save cancel request" />
+
+		<choice doc:name="Validate Cancel Request">
+			<when expression="#[
+				isEmpty(vars.request.correlationId default '') or
+				isEmpty(vars.request.sagaId default '') or
+				isEmpty(vars.request.stepId default '') or
+				(isEmpty(vars.request.shippingId default '') and isEmpty(vars.request.orderId default ''))
+			]">
+				<set-variable variableName="httpStatus" value="400" doc:name="Status 400" />
+				<set-payload value="#[output application/java ---
+{
+	correlationId: vars.request.correlationId default null,
+	sagaId: vars.request.sagaId default null,
+	stepId: vars.request.stepId default null,
+	stepName: 'CANCEL_SHIPPING',
+	attempt: vars.request.attempt default 1,
+	outcome: 'FAILURE',
+	completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
+	failureType: 'BUSINESS',
+	failureCode: 'INVALID_REQUEST',
+	failureMessage: 'correlationId, sagaId, stepId and either shippingId or orderId are required',
+	retryable: false
+}]" doc:name="Invalid Request Payload" />
+			</when>
+			<otherwise>
+				<set-variable variableName="command" value="#[output application/java ---
+{
+	correlationId: vars.request.correlationId,
+	sagaId: vars.request.sagaId,
+	stepId: vars.request.stepId,
+	stepName: vars.request.stepName default 'CANCEL_SHIPPING',
+	commandType: vars.request.commandType default 'CANCEL',
+	attempt: vars.request.attempt default 1,
+	payload: {
+		shippingId: vars.request.shippingId default null,
+		orderId: vars.request.orderId default null,
+		reason: vars.request.reason default 'SAGA_COMPENSATION'
+	}
+}]" doc:name="Build Cancel Command" />
+
+				<set-variable variableName="dedupKey" value="#[(vars.command.sagaId as String) ++ ':' ++ (vars.command.stepId as String) ++ ':CANCEL']" doc:name="Set dedupKey" />
+
+				<flow-ref doc:name="Invoke Cancel Sub-Flow" name="shipping-cancel-Sub_Flow" />
+
+				<set-variable variableName="httpStatus" value="#[
+					if (payload.outcome == 'SUCCESS') 200
+					else if (payload.failureCode == 'SHIPPING_NOT_FOUND') 404
+					else if (payload.failureCode == 'INVALID_SHIPPING_STATE' or payload.failureCode == 'COMMAND_IN_PROGRESS') 409
+					else if (payload.retryable default false) 503
+					else 400
+				]" doc:name="Set status from reply" />
+			</otherwise>
+		</choice>
+
+		<ee:transform doc:name="Reply to JSON">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+
+		<error-handler>
+			<on-error-continue type="ANY" logException="true">
+				<flow-ref name="shipping-handle-duplicate-race-sub-flow" doc:name="Handle Shipping Duplicate Race or Delegate" />
+			</on-error-continue>
+		</error-handler>
+	</flow>
+
+	<!-- ==================== LOCAL REUSABLE RACE-CONDITION SUB-FLOW ==================== -->
+	<sub-flow name="shipping-handle-duplicate-race-sub-flow">
+		<choice doc:name="Check Duplicate Key Race">
+			<when expression="#[contains((error.description default ''), 'Duplicate entry') or contains((error.description default ''), 'dedup_key')]">
+				<db:select config-ref="shipping_Database_Config" target="raceCheckResult" doc:name="Read winner response">
+					<db:sql><![CDATA[SELECT result_payload FROM processed_commands WHERE dedup_key = :dedupKey]]></db:sql>
+					<db:input-parameters><![CDATA[#[{dedupKey: vars.dedupKey}]]]></db:input-parameters>
+				</db:select>
+				<choice doc:name="Winner response available?">
+					<when expression="#[!isEmpty(vars.raceCheckResult default []) and !isEmpty(vars.raceCheckResult[0].result_payload default null)]">
+						<set-variable variableName="racePayload" value="#[output application/java ---
+							if (vars.raceCheckResult[0].result_payload is Object) vars.raceCheckResult[0].result_payload
+							else read(vars.raceCheckResult[0].result_payload as String, 'application/json')]" doc:name="Set racePayload" />
+						<set-variable variableName="httpStatus" value="#[if (vars.racePayload.outcome == 'SUCCESS') 200
+							else if (vars.racePayload.failureCode == 'SHIPPING_NOT_FOUND') 404
+							else if (['SHIPPING_DECLINED', 'SERVICE_UNAVAILABLE', 'INVALID_SHIPPING_STATE', 'COMMAND_IN_PROGRESS'] contains (vars.racePayload.failureCode default '')) 409
+							else if (vars.racePayload.retryable default false) 503
+							else 400]" doc:name="Set race status" />
+						<set-payload value="#[vars.racePayload]" doc:name="Set race result payload" />
+					</when>
+					<otherwise>
+						<set-variable variableName="httpStatus" value="409" doc:name="Status 409" />
+						<set-payload value="#[output application/java ---
+{
+	correlationId: vars.command.correlationId default null,
+	sagaId: vars.command.sagaId default null,
+	stepId: vars.command.stepId default null,
+	stepName: vars.command.stepName default 'SHIPPING_OPERATION',
+	attempt: vars.command.attempt default 1,
+	outcome: 'FAILURE',
+	completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
+	failureType: 'BUSINESS',
+	failureCode: 'COMMAND_IN_PROGRESS',
+	failureMessage: 'An identical shipping command is currently being processed',
+	retryable: false
+}]" doc:name="Set command in progress payload" />
+					</otherwise>
+				</choice>
+				<ee:transform doc:name="Race Reply to JSON">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</when>
+			<otherwise>
+				<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Invoke Global Error Handler Sub-flow" />
+			</otherwise>
+		</choice>
+	</sub-flow>
+
+	<!-- ==================== DISPATCH SUB-FLOW ==================== -->
+	<sub-flow name="shipping-dispatch-Sub_Flow">
+		<set-variable variableName="shippingReply" value="#[null]" doc:name="Init shippingReply" />
+
+		<try doc:name="Shipping Transaction Boundary" transactionalAction="ALWAYS_BEGIN" transactionType="LOCAL">
+			<db:select config-ref="shipping_Database_Config" target="existingDispatch" doc:name="Check processed commands">
+				<db:sql><![CDATA[SELECT dedup_key, result_payload FROM processed_commands WHERE dedup_key = :dedupKey FOR UPDATE]]></db:sql>
+				<db:input-parameters><![CDATA[#[{dedupKey: vars.dedupKey}]]]></db:input-parameters>
+			</db:select>
+
+			<choice doc:name="Check Idempotency Hit">
+				<when expression="#[!isEmpty(vars.existingDispatch default [])]">
+					<logger level="INFO" doc:name="Log Replay" message="#['[IDEMPOTENT_REPLAY] Replaying shipping dispatch for dedupKey: ' ++ vars.dedupKey]" />
+					<set-variable variableName="shippingReply" value="#[output application/java ---
+						if (vars.existingDispatch[0].result_payload is Object)
+							vars.existingDispatch[0].result_payload
+						else
+							read(vars.existingDispatch[0].result_payload as String, 'application/json')]" doc:name="Replay saved response" />
+				</when>
+				<otherwise>
+					<choice doc:name="Simulate Courier Availability">
+						<when expression="#[vars.command.payload.postalCode == '000000' or vars.command.payload.serviceLevel == 'FAIL_DISPATCH']">
+							<set-variable variableName="shippingReply" value="#[output application/java ---
+{
+	correlationId: vars.command.correlationId,
+	sagaId: vars.command.sagaId,
+	stepId: vars.command.stepId,
+	stepName: vars.command.stepName,
+	attempt: vars.command.attempt,
+	outcome: 'FAILURE',
+	completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
+	failureType: 'BUSINESS',
+	failureCode: 'SERVICE_UNAVAILABLE',
+	failureMessage: 'Carrier service unavailable for destination postal code',
+	retryable: false
+}]" doc:name="Build Failure Reply" />
+						</when>
+						<otherwise>
+							<set-variable variableName="shippingId" value="#['SHP-' ++ (uuid()[0 to 7] as String)]" doc:name="Generate shippingId" />
+							<set-variable variableName="trackingNumber" value="#['TRK-' ++ upper(uuid()[0 to 11] as String)]" doc:name="Generate trackingNumber" />
+
+							<db:insert config-ref="shipping_Database_Config" doc:name="Insert shipping request">
+								<db:sql><![CDATA[INSERT INTO shipping_requests (
+    shipping_id, order_id, saga_id, step_id, correlation_id,
+    address_line1, city, state, postal_code, country,
+    service_level, tracking_number, status
+) VALUES (
+    :shippingId, :orderId, :sagaId, :stepId, :correlationId,
+    :addressLine1, :city, :state, :postalCode, :country,
+    :serviceLevel, :trackingNumber, 'DISPATCHED'
+)]]></db:sql>
+								<db:input-parameters><![CDATA[#[{
+	shippingId: vars.shippingId,
+	orderId: vars.command.payload.orderId,
+	sagaId: vars.command.sagaId,
+	stepId: vars.command.stepId,
+	correlationId: vars.command.correlationId,
+	addressLine1: vars.command.payload.addressLine1,
+	city: vars.command.payload.city,
+	state: vars.command.payload.state,
+	postalCode: vars.command.payload.postalCode,
+	country: vars.command.payload.country,
+	serviceLevel: vars.command.payload.serviceLevel,
+	trackingNumber: vars.trackingNumber
+}]]]></db:input-parameters>
+							</db:insert>
+
+							<set-variable variableName="shippingReply" value="#[output application/java ---
+{
+	correlationId: vars.command.correlationId,
+	sagaId: vars.command.sagaId,
+	stepId: vars.command.stepId,
+	stepName: vars.command.stepName,
+	attempt: vars.command.attempt,
+	outcome: 'SUCCESS',
+	completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
+	result: {
+		shippingId: vars.shippingId,
+		orderId: vars.command.payload.orderId,
+		trackingNumber: vars.trackingNumber,
+		serviceLevel: vars.command.payload.serviceLevel,
+		status: 'DISPATCHED'
+	}
+}]" doc:name="Build Success Reply" />
+						</otherwise>
+					</choice>
+
+					<db:insert config-ref="shipping_Database_Config" doc:name="Save Idempotent Command">
+						<db:sql><![CDATA[INSERT INTO processed_commands (dedup_key, step_id, command_type, result_payload, processed_at)
+VALUES (:dedupKey, :stepId, 'DISPATCH', :resultPayload, CURRENT_TIMESTAMP)]]></db:sql>
+						<db:input-parameters><![CDATA[#[{
+	dedupKey: vars.dedupKey,
+	stepId: vars.command.stepId,
+	resultPayload: write(vars.shippingReply, 'application/json')
+}]]]></db:input-parameters>
+					</db:insert>
+				</otherwise>
+			</choice>
+		</try>
+
+		<set-payload value="#[vars.shippingReply]" doc:name="Return shippingReply" />
+	</sub-flow>
+
+	<!-- ==================== CANCEL SUB-FLOW ==================== -->
+	<sub-flow name="shipping-cancel-Sub_Flow">
+		<set-variable variableName="cancelReply" value="#[null]" doc:name="Init cancelReply" />
+
+		<try doc:name="Cancel Transaction Boundary" transactionalAction="ALWAYS_BEGIN" transactionType="LOCAL">
+			<db:select config-ref="shipping_Database_Config" target="existingCancel" doc:name="Check processed commands">
+				<db:sql><![CDATA[SELECT dedup_key, result_payload FROM processed_commands WHERE dedup_key = :dedupKey FOR UPDATE]]></db:sql>
+				<db:input-parameters><![CDATA[#[{dedupKey: vars.dedupKey}]]]></db:input-parameters>
+			</db:select>
+
+			<choice doc:name="Check Existing Cancel Command">
+				<when expression="#[!isEmpty(vars.existingCancel default [])]">
+					<logger level="INFO" doc:name="Log Replay" message="#['[IDEMPOTENT_CANCEL] Replaying existing cancel for dedupKey: ' ++ vars.dedupKey]" />
+					<set-variable variableName="cancelReply" value="#[output application/java ---
+						if (vars.existingCancel[0].result_payload is Object)
+							vars.existingCancel[0].result_payload
+						else
+							read(vars.existingCancel[0].result_payload as String, 'application/json')]" doc:name="Replay cached reply" />
+				</when>
+				<otherwise>
+					<choice doc:name="Lookup by Shipping ID or Order ID">
+						<when expression="#[!isEmpty(vars.command.payload.shippingId default '')]">
+							<db:select config-ref="shipping_Database_Config" target="shippingRows" doc:name="Lock by ShippingId">
+								<db:sql><![CDATA[SELECT shipping_id, order_id, tracking_number, service_level, status FROM shipping_requests WHERE shipping_id = :shippingId FOR UPDATE]]></db:sql>
+								<db:input-parameters><![CDATA[#[{shippingId: vars.command.payload.shippingId}]]]></db:input-parameters>
+							</db:select>
+						</when>
+						<otherwise>
+							<db:select config-ref="shipping_Database_Config" target="shippingRows" doc:name="Lock by OrderId">
+								<db:sql><![CDATA[SELECT shipping_id, order_id, tracking_number, service_level, status FROM shipping_requests WHERE order_id = :orderId FOR UPDATE]]></db:sql>
+								<db:input-parameters><![CDATA[#[{orderId: vars.command.payload.orderId}]]]></db:input-parameters>
+							</db:select>
+						</otherwise>
+					</choice>
+
+					<choice doc:name="Check Shipping State">
+						<when expression="#[isEmpty(vars.shippingRows default [])]">
+							<raise-error type="SHIPPING:SHIPPING_NOT_FOUND" description="#['No shipping request found for cancellation']" />
+						</when>
+
+						<when expression="#[vars.shippingRows[0].status == 'DISPATCHED']">
+							<db:update config-ref="shipping_Database_Config" target="updateResult" doc:name="Mark shipping cancelled">
+								<db:sql><![CDATA[UPDATE shipping_requests
+SET status = 'CANCELLED',
+    cancelled_at = CURRENT_TIMESTAMP
+WHERE shipping_id = :shippingId
+  AND status = 'DISPATCHED']]></db:sql>
+								<db:input-parameters><![CDATA[#[{
+	shippingId: vars.shippingRows[0].shipping_id
+}]]]></db:input-parameters>
+							</db:update>
+
+							<set-variable variableName="cancelReply" value="#[output application/java ---
+{
+	correlationId: vars.command.correlationId,
+	sagaId: vars.command.sagaId,
+	stepId: vars.command.stepId,
+	stepName: vars.command.stepName,
+	attempt: vars.command.attempt,
+	outcome: 'SUCCESS',
+	completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
+	result: {
+		shippingId: vars.shippingRows[0].shipping_id,
+		orderId: vars.shippingRows[0].order_id,
+		trackingNumber: vars.shippingRows[0].tracking_number,
+		status: 'CANCELLED'
+	}
+}]" doc:name="Build Cancel Success Reply" />
+						</when>
+
+						<when expression="#[vars.shippingRows[0].status == 'CANCELLED']">
+							<logger level="INFO" doc:name="Log Already Cancelled" message="#['[CANCEL_IDEMPOTENT] Shipping ' ++ vars.shippingRows[0].shipping_id ++ ' already CANCELLED. No action taken.']" />
+							<set-variable variableName="cancelReply" value="#[output application/java ---
+{
+	correlationId: vars.command.correlationId,
+	sagaId: vars.command.sagaId,
+	stepId: vars.command.stepId,
+	stepName: vars.command.stepName,
+	attempt: vars.command.attempt,
+	outcome: 'SUCCESS',
+	completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
+	result: {
+		shippingId: vars.shippingRows[0].shipping_id,
+		orderId: vars.shippingRows[0].order_id,
+		trackingNumber: vars.shippingRows[0].tracking_number,
+		status: 'CANCELLED'
+	}
+}]" doc:name="Build Already Cancelled Reply" />
+						</when>
+
+						<otherwise>
+							<raise-error type="SHIPPING:INVALID_SHIPPING_STATE" description="#['Shipping ' ++ vars.shippingRows[0].shipping_id ++ ' cannot be cancelled from state: ' ++ vars.shippingRows[0].status]" />
+						</otherwise>
+					</choice>
+
+					<db:insert config-ref="shipping_Database_Config" doc:name="Save Idempotent Cancel Command">
+						<db:sql><![CDATA[INSERT INTO processed_commands (dedup_key, step_id, command_type, result_payload, processed_at)
+VALUES (:dedupKey, :stepId, 'CANCEL', :resultPayload, CURRENT_TIMESTAMP)]]></db:sql>
+						<db:input-parameters><![CDATA[#[{
+	dedupKey: vars.dedupKey,
+	stepId: vars.command.stepId,
+	resultPayload: write(vars.cancelReply, 'application/json')
+}]]]></db:input-parameters>
+					</db:insert>
+				</otherwise>
+			</choice>
+		</try>
+
+		<set-payload value="#[vars.cancelReply]" doc:name="Return cancelReply" />
+	</sub-flow>
+
+</mule>

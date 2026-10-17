@@ -1,0 +1,13 @@
+%dw 2.0
+
+type auto_7bf12c9f_6b1d_4a25_a822_a5fb67b656c9_Input_Payload = {
+  stepName?: String, 
+  orderId: String, 
+  sagaId: String, 
+  stepId: String, 
+  correlationId: String, 
+  attempt?: Number, 
+  items: Array<{    quantity: Number,     sku: String,     _?: Any  }>, 
+  _?: Any
+}
+
