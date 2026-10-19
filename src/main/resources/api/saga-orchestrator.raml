@@ -1,0 +1,192 @@
+#%RAML 1.0
+title: Saga Process Orchestrator API
+version: v1
+mediaType: [ application/json ]
+protocols: [ HTTP, HTTPS ]
+baseUri: http://localhost:8084/api/v1
+
+types:
+  OrderItem:
+    type: object
+    properties:
+      sku:
+        type: string
+        required: true
+        example: "SKU-TSHIRT-BLK-M"
+      quantity:
+        type: integer
+        minimum: 1
+        required: true
+        example: 2
+      unitPrice:
+        type: number
+        minimum: 0.01
+        required: true
+        example: 1499.00
+
+  PaymentDetails:
+    type: object
+    properties:
+      method:
+        type: string
+        enum: [ CARD, UPI, WALLET ]
+        required: true
+        example: "CARD"
+      cardToken:
+        type: string
+        required: true
+        example: "TKN-4d9a77e1c0"
+
+  ShippingAddress:
+    type: object
+    properties:
+      addressLine1:
+        type: string
+        required: true
+        example: "21 Anna Salai"
+      city:
+        type: string
+        required: true
+        example: "Chennai"
+      state:
+        type: string
+        required: true
+        example: "Tamil Nadu"
+      postalCode:
+        type: string
+        required: true
+        example: "600002"
+      country:
+        type: string
+        required: true
+        example: "India"
+      serviceLevel:
+        type: string
+        enum: [ STANDARD, EXPRESS ]
+        default: "STANDARD"
+
+  OrderFulfilmentRequest:
+    type: object
+    properties:
+      orderId:
+        type: string
+        required: true
+        example: "ORD-2026-1001"
+      customerId:
+        type: string
+        required: true
+        example: "CUST-501"
+      currency:
+        type: string
+        minLength: 3
+        maxLength: 3
+        default: "INR"
+        example: "INR"
+      totalAmount:
+        type: number
+        minimum: 0.01
+        required: true
+        example: 3797.00
+      items:
+        type: OrderItem[]
+        minItems: 1
+        required: true
+      payment:
+        type: PaymentDetails
+        required: true
+      shipping:
+        type: ShippingAddress
+        required: true
+
+  InitiationResponse:
+    type: object
+    properties:
+      sagaId: string
+      orderId: string
+      sagaState: string
+      statusUrl: string
+      correlationId: string
+
+  SagaStepStatus:
+    type: object
+    properties:
+      stepSequence: integer
+      stepName: string
+      stepState: string
+      attemptCount: integer
+      compensationState: string
+      failureCode?: string
+      startedAt?: string
+      completedAt?: string
+      compensatedAt?: string
+
+  SagaStatusResponse:
+    type: object
+    properties:
+      sagaId: string
+      orderId: string
+      sagaState: string
+      correlationId: string
+      failureCode?: string
+      failureMessage?: string
+      startedAt: string
+      completedAt?: string
+      steps: SagaStepStatus[]
+
+  ErrorResponse:
+    type: object
+    properties:
+      errorCode: string
+      message: string
+      correlationId?: string
+      timestamp: datetime
+
+/sagas:
+  /order-fulfilment:
+    post:
+      description: Initiates a new event-driven Saga for order fulfillment
+      body:
+        application/json:
+          type: OrderFulfilmentRequest
+      responses:
+        202:
+          description: Saga Accepted and scheduled
+          body:
+            application/json:
+              type: InitiationResponse
+        400:
+          description: Invalid request payload
+          body:
+            application/json:
+              type: ErrorResponse
+        409:
+          description: Duplicate saga for order already in flight
+          body:
+            application/json:
+              type: InitiationResponse
+        500:
+          body:
+            application/json:
+              type: ErrorResponse
+
+  /{sagaId}:
+    uriParameters:
+      sagaId:
+        type: string
+        example: "SAGA-2026-0000771"
+    get:
+      description: Retrieves durable status of the saga instance and all executing steps
+      responses:
+        200:
+          body:
+            application/json:
+              type: SagaStatusResponse
+        404:
+          description: Saga ID not found
+          body:
+            application/json:
+              type: ErrorResponse
+        500:
+          body:
+            application/json:
+              type: ErrorResponse

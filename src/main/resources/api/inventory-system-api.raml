@@ -15,9 +15,9 @@ types:
   SagaContext:
     type: object
     properties:
-      correlationId: string
-      sagaId: string
-      stepId: string
+      correlationId?: string
+      sagaId?: string
+      stepId?: string
       stepName?: string
       attempt?:
         type: integer
@@ -59,9 +59,8 @@ types:
   ReleaseRequest:
     type: SagaContext
     properties:
-      reservationId:
-        type: string
-        minLength: 1
+      reservationId?: string
+      reservationIds?: string[]
       orderId?: string
       reason?: string
     example:
@@ -111,6 +110,9 @@ types:
       retryable?: boolean
       errorCode?: string
       message?: string
+      sku?: string
+      requestedQuantity?: integer
+      availableQuantity?: integer
 
   StockRecord:
     type: object
@@ -172,9 +174,12 @@ types:
           application/json:
             type: FailureReply
             example:
+              errorCode: UNKNOWN_SKU
+              message: The requested SKU does not exist.
+              sku: SKU-INVALID-001
               outcome: FAILURE
               failureCode: UNKNOWN_SKU
-              failureMessage: Unknown SKU SKU-DOES-NOT-EXIST
+              failureMessage: The requested SKU does not exist.
               retryable: false
       409:
         description: Insufficient stock or an identical command is still processing.
@@ -182,9 +187,14 @@ types:
           application/json:
             type: FailureReply
             example:
+              errorCode: INSUFFICIENT_QUANTITY
+              message: Requested quantity exceeds available stock.
+              sku: SKU-TSHIRT-BLK-M
+              requestedQuantity: 150
+              availableQuantity: 100
               outcome: FAILURE
-              failureCode: INSUFFICIENT_STOCK
-              failureMessage: Insufficient stock for SKU SKU-TSHIRT-BLK-M
+              failureCode: INSUFFICIENT_QUANTITY
+              failureMessage: Requested quantity exceeds available stock.
               retryable: false
       503:
         description: Retryable technical failure.

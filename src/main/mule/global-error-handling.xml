@@ -92,7 +92,7 @@ var errorNamespace = error.errorType.namespace default ''
 var errorIdentifier = error.errorType.identifier default ''
 var isBusiness = (
     (['INVENTORY', 'PAYMENT', 'SHIPPING', 'APIKIT'] contains errorNamespace) or
-    (['UNKNOWN_SKU', 'RESERVATION_NOT_FOUND', 'INSUFFICIENT_STOCK', 'COMMAND_IN_PROGRESS',
+    (['UNKNOWN_SKU', 'RESERVATION_NOT_FOUND', 'INSUFFICIENT_STOCK', 'INSUFFICIENT_QUANTITY', 'COMMAND_IN_PROGRESS',
       'INVALID_COMMAND', 'INVALID_ITEM', 'INVALID_ITEMS', 'INVALID_REQUEST', 'INVALID_QUANTITY',
       'PAYMENT_DECLINED', 'PAYMENT_NOT_FOUND', 'INVALID_PAYMENT_STATE',
       'SHIPPING_DECLINED', 'SERVICE_UNAVAILABLE', 'SHIPPING_NOT_FOUND', 'INVALID_SHIPPING_STATE',
@@ -129,6 +129,12 @@ var failureMessage = if (isRetryable)
     'Transient connectivity failure to database or external service'
 else if (errorNamespace == 'DB' and !isBusiness)
     'A database processing error occurred'
+else if (errorIdentifier == 'UNKNOWN_SKU')
+    'The requested SKU does not exist.'
+else if (errorIdentifier == 'INSUFFICIENT_QUANTITY' or errorIdentifier == 'INSUFFICIENT_STOCK')
+    'Requested quantity exceeds available stock.'
+else if (errorIdentifier == 'INVALID_QUANTITY')
+    'Quantity must be a positive integer.'
 else if (errorNamespace == 'APIKIT') (
     if (errorIdentifier == 'BAD_REQUEST') 'Malformed JSON request or schema validation constraint violated'
     else if (errorIdentifier == 'NOT_FOUND') 'Requested API resource not found'
@@ -140,18 +146,26 @@ else if (errorNamespace == 'APIKIT') (
 ) else
     rawDescription
 
+var resolvedSku = vars.failedSku default vars.currentItem.sku default vars.requestedSku default null
+var resolvedRequestedQty = vars.failedRequestedQuantity default vars.currentItem.quantity default null
+var resolvedAvailableQty = vars.failedAvailableQuantity default vars.availableQuantity default null
 ---
 {
+    errorCode: failureCode,
+    message: failureMessage,
+    (sku: resolvedSku) if (resolvedSku != null),
+    (requestedQuantity: resolvedRequestedQty as Number) if (resolvedRequestedQty != null),
+    (availableQuantity: resolvedAvailableQty as Number) if (resolvedAvailableQty != null),
+    failureCode: failureCode,
+    failureMessage: failureMessage,
+    outcome: 'FAILURE',
     correlationId: resolvedCorrelationId,
     sagaId: resolvedSagaId,
     stepId: resolvedStepId,
     stepName: resolvedStepName,
     attempt: resolvedAttempt,
-    outcome: 'FAILURE',
     completedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"},
     failureType: failureType,
-    failureCode: failureCode,
-    failureMessage: failureMessage,
     retryable: isRetryable
 }]]></ee:set-payload>
 			</ee:message>
@@ -166,12 +180,12 @@ var isRetryable = (
     errorNamespace == 'CONNECTIVITY'
 )
 ---
-if (vars.httpStatus != null) vars.httpStatus as Number
-else if (['UNKNOWN_SKU', 'RESERVATION_NOT_FOUND', 'PAYMENT_NOT_FOUND', 'SHIPPING_NOT_FOUND'] contains errorIdentifier) 404
-else if (['INVALID_COMMAND', 'INVALID_ITEM', 'INVALID_ITEMS', 'INVALID_REQUEST', 'INVALID_QUANTITY'] contains errorIdentifier) 400
-else if (['INSUFFICIENT_STOCK', 'COMMAND_IN_PROGRESS', 'PAYMENT_DECLINED', 'INVALID_PAYMENT_STATE',
+if (['UNKNOWN_SKU', 'RESERVATION_NOT_FOUND', 'PAYMENT_NOT_FOUND', 'SHIPPING_NOT_FOUND'] contains errorIdentifier) 404
+else if (['INSUFFICIENT_STOCK', 'INSUFFICIENT_QUANTITY', 'COMMAND_IN_PROGRESS', 'PAYMENT_DECLINED', 'INVALID_PAYMENT_STATE',
           'STOCK_RESTORE_FAILED', 'RESERVATION_UPDATE_FAILED', 'INVALID_RESERVATION_STATE',
           'SHIPPING_DECLINED', 'SERVICE_UNAVAILABLE', 'INVALID_SHIPPING_STATE'] contains errorIdentifier) 409
+else if (['INVALID_COMMAND', 'INVALID_ITEM', 'INVALID_ITEMS', 'INVALID_REQUEST', 'INVALID_QUANTITY'] contains errorIdentifier) 400
+else if (vars.httpStatus != null and !(['200', '201', '202'] contains (vars.httpStatus as String))) vars.httpStatus as Number
 else if (isRetryable) 503
 else if (errorIdentifier == 'NOT_FOUND') 404
 else if (errorIdentifier == 'BAD_REQUEST') 400

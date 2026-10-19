@@ -1,34 +1,34 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+<mule xmlns:amqp="http://www.mulesoft.org/schema/mule/amqp"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
 	xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
 	xmlns:db="http://www.mulesoft.org/schema/mule/db"
 	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
 	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
 	xmlns:http="http://www.mulesoft.org/schema/mule/http"
-	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-	xsi:schemaLocation="
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="
 		http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
 		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
 		http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
 		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
-		http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+		http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+		http://www.mulesoft.org/schema/mule/amqp http://www.mulesoft.org/schema/mule/amqp/current/mule-amqp.xsd">
 
 	<!-- ===================== GLOBAL CONFIGURATIONS ===================== -->
-	<!-- 1. Properties file loaded FIRST -->
 	<configuration-properties doc:name="Configuration properties" file="config.yaml" />
 
-	<!-- 2. HTTP Listener Config on port 8081 -->
+	<!-- HTTP Listener Config on port 8081 -->
 	<http:listener-config name="HTTP_Listener_config1" doc:name="HTTP Listener config">
 		<http:listener-connection host="0.0.0.0" port="8081" />
 	</http:listener-config>
 
-	<!-- 3. APIKit Config -->
+	<!-- APIKit Config -->
 	<apikit:config name="inventory-system-api-config"
 		api="inventory-system-api.raml"
 		outboundHeadersMapName="outboundHeaders"
 		httpStatusVarName="httpStatus" />
 
-	<!-- 4. Database Config (Aiven Cloud MySQL) with Bounded Reconnection Strategy -->
+	<!-- Database Config (Aiven Cloud MySQL) with Bounded Reconnection Strategy -->
 	<db:config name="Database_Config" doc:name="Database Config" doc:id="ede1b662-bb70-4f4d-8a07-b56a7c4c3b46" >
 		<db:my-sql-connection host="${db.host}" port="${db.port}" user="${db.user}" password="${db.password}" database="${database.inventory}">
 			<reconnection>
@@ -50,8 +50,6 @@
 		</http:listener>
 
 		<apikit:router config-ref="inventory-system-api-config" />
-
-		<!-- Centralized Global Error Handler reference replaces duplicated APIKit handlers -->
 		<error-handler ref="global-error-handler" />
 	</flow>
 
@@ -70,7 +68,7 @@
 		<error-handler ref="global-error-handler" />
 	</flow>
 
-	<!-- ===================== GET /stock/{sku} ===================== -->
+	<!-- ===================== GET /stock/{sku} (HTTP) ===================== -->
 	<flow name="get:\stock\(sku):inventory-system-api-config">
 		<set-variable variableName="requestedSku" value="#[attributes.uriParams.sku]" doc:name="Save SKU" />
 		<db:select target="stockRows" doc:name="Read stock by SKU" config-ref="Database_Config">
@@ -106,9 +104,20 @@ vars.stockRows[0]]]></ee:set-payload>
 		</choice>
 	</flow>
 
-	<!-- ===================== POST /reserve ===================== -->
+	<!-- ===================== POST /reserve (HTTP REST) ===================== -->
 	<flow name="post:\reserve:application\json:inventory-system-api-config">
-		<set-variable variableName="request" value="#[output application/java --- if (payload is String or payload is Binary) read(payload, 'application/json') else payload]" doc:name="Save reserve request" />
+		<set-variable variableName="request" value="#[output application/java
+var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
+var body = raw.payload default raw
+---
+raw ++ {
+    correlationId: raw.correlationId default correlationId,
+    sagaId: raw.sagaId default ('SAGA-' ++ (uuid() as String)),
+    stepId: raw.stepId default ('STEP-' ++ (uuid() as String)),
+    orderId: raw.orderId default body.orderId,
+    items: raw.items default body.items
+}]" doc:name="Save reserve request" />
+
 		<choice doc:name="Validate reserve request">
 			<when expression="#[
     isEmpty(vars.request.correlationId default '') or
@@ -129,8 +138,18 @@ vars.stockRows[0]]]></ee:set-payload>
     )
 ]">
 				<set-variable variableName="httpStatus" value="400" doc:name="Status 400" />
-				<set-payload value="#[output application/java ---
+				<set-payload value="#[output application/java
+var hasInvalidQuantity = !isEmpty((vars.request.items default []) filter ((item) -&gt; 
+    (item is Object) and (item.quantity == null or not (item.quantity is Number) or item.quantity &lt;= 0 or floor(item.quantity) != item.quantity)
+))
+var badItem = ((vars.request.items default []) filter ((item) -&gt; 
+    (item is Object) and (item.quantity == null or not (item.quantity is Number) or item.quantity &lt;= 0 or floor(item.quantity) != item.quantity)
+))[0] default {}
+---
 {
+    errorCode: if (hasInvalidQuantity) 'INVALID_QUANTITY' else 'INVALID_REQUEST',
+    message: if (hasInvalidQuantity) 'Quantity must be a positive integer.' else 'correlationId, sagaId, stepId, orderId and a non-empty items array are required.',
+    (sku: badItem.sku) if (!isEmpty(badItem.sku default '')),
     correlationId: vars.request.correlationId default null,
     sagaId: vars.request.sagaId default null,
     stepId: vars.request.stepId default null,
@@ -139,8 +158,8 @@ vars.stockRows[0]]]></ee:set-payload>
     outcome: 'FAILURE',
     completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
     failureType: 'BUSINESS',
-    failureCode: 'INVALID_REQUEST',
-    failureMessage: 'correlationId, sagaId, stepId, orderId and a non-empty items array (valid SKU, positive whole-number quantity) are required',
+    failureCode: if (hasInvalidQuantity) 'INVALID_QUANTITY' else 'INVALID_REQUEST',
+    failureMessage: if (hasInvalidQuantity) 'Quantity must be a positive integer.' else 'correlationId, sagaId, stepId, orderId and a non-empty items array are required.',
     retryable: false
 }]" doc:name="Invalid request payload" />
 			</when>
@@ -160,9 +179,9 @@ vars.stockRows[0]]]></ee:set-payload>
 }]" doc:name="Build reserve command" />
 				<flow-ref doc:name="Reserve sub-flow" name="inventory-reserver-Sub_Flow" />
 				<set-variable variableName="httpStatus" value="#[if (payload.outcome == 'SUCCESS') 200
-else if (payload.failureCode == 'UNKNOWN_SKU') 404
-else if (['INVALID_COMMAND', 'INVALID_ITEM', 'INVALID_ITEMS', 'INVALID_REQUEST', 'INVALID_QUANTITY'] contains (payload.failureCode default '')) 400
-else if (payload.failureCode == 'INSUFFICIENT_STOCK' or payload.failureCode == 'COMMAND_IN_PROGRESS') 409
+else if (payload.failureCode == 'UNKNOWN_SKU' or payload.errorCode == 'UNKNOWN_SKU') 404
+else if (['INVALID_COMMAND', 'INVALID_ITEM', 'INVALID_ITEMS', 'INVALID_REQUEST', 'INVALID_QUANTITY'] contains (payload.failureCode default payload.errorCode default '')) 400
+else if (['INSUFFICIENT_STOCK', 'INSUFFICIENT_QUANTITY', 'COMMAND_IN_PROGRESS'] contains (payload.failureCode default payload.errorCode default '')) 409
 else if (payload.retryable default false) 503
 else 500]" doc:name="Set status from reply" />
 			</otherwise>
@@ -176,7 +195,6 @@ payload]]></ee:set-payload>
 			</ee:message>
 		</ee:transform>
 
-		<!-- Local Error Handler: Manages local DB race conditions and delegates to shared error subflow -->
 		<error-handler>
 			<on-error-continue type="ANY" logException="true">
 				<flow-ref name="inventory-handle-duplicate-race-sub-flow" doc:name="Handle Duplicate Race or Delegate" />
@@ -184,9 +202,20 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- ===================== POST /release ===================== -->
+	<!-- ===================== POST /release (HTTP REST) ===================== -->
 	<flow name="post:\release:application\json:inventory-system-api-config">
-		<set-variable variableName="request" value="#[output application/java --- if (payload is String or payload is Binary) read(payload, 'application/json') else payload]" doc:name="Save release request" />
+		<set-variable variableName="request" value="#[output application/java
+var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
+var body = raw.payload default raw
+---
+raw ++ {
+    correlationId: raw.correlationId default correlationId,
+    sagaId: raw.sagaId default ('SAGA-' ++ (uuid() as String)),
+    stepId: raw.stepId default ('STEP-' ++ (uuid() as String)),
+    orderId: raw.orderId default body.orderId,
+    reservationId: raw.reservationId default body.reservationId,
+    reservationIds: raw.reservationIds default body.reservationIds
+}]" doc:name="Save release request" />
 
 		<choice doc:name="Validate release request">
 			<when expression="#[
@@ -253,10 +282,260 @@ payload]]></ee:set-payload>
 			</ee:message>
 		</ee:transform>
 
-		<!-- Local Error Handler: Manages local DB race conditions and delegates to shared error subflow -->
 		<error-handler>
 			<on-error-continue type="ANY" logException="true">
 				<flow-ref name="inventory-handle-duplicate-race-sub-flow" doc:name="Handle Duplicate Race or Delegate" />
+			</on-error-continue>
+		</error-handler>
+	</flow>
+
+	<!-- ===================================================================== -->
+	<!-- AMQP EVENT-DRIVEN FLOWS (Saga Orchestration)                          -->
+	<!-- ===================================================================== -->
+
+	<!-- 1. AMQP Listener: Reserve Inventory Command -->
+	<flow name="inventory-reserve-amqp-flow">
+		<amqp:listener doc:name="Listen inventory.reserve.command"
+			config-ref="RabbitMQ_Config"
+			queueName="inventory.reserve.command"
+			ackMode="AUTO"
+			outputMimeType="application/json">
+			<amqp:fallback-queue-definition removalStrategy="EXPLICIT" />
+		</amqp:listener>
+
+		<set-variable variableName="request" value="#[output application/java
+var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
+var body = if (raw.payload is String) read(raw.payload, 'application/json') else (raw.payload default raw)
+var resolvedItems = if (body.items is String) read(body.items, 'application/json') else (raw.items default body.items default [])
+var resolvedOrderId = raw.orderId default body.orderId default null
+---
+raw ++ {
+    correlationId: raw.correlationId default attributes.properties.correlationId default correlationId,
+    sagaId: raw.sagaId default body.sagaId default ('SAGA-' ++ (uuid() as String)),
+    stepId: raw.stepId default body.stepId default ('STEP-' ++ (uuid() as String)),
+    replyTo: raw.replyTo default attributes.properties.replyTo default 'inventory.reserve.reply',
+    orderId: resolvedOrderId,
+    items: resolvedItems
+}]" doc:name="Save reserve request" />
+
+		<choice doc:name="Validate reserve request">
+			<when expression="#[
+    isEmpty(vars.request.correlationId default '') or
+    isEmpty(vars.request.sagaId default '') or
+    isEmpty(vars.request.stepId default '') or
+    isEmpty(vars.request.orderId default '') or
+    not (vars.request.items is Array) or
+    isEmpty(vars.request.items default []) or
+    (vars.request.attempt != null and (not (vars.request.attempt is Number) or vars.request.attempt &lt; 1 or floor(vars.request.attempt) != vars.request.attempt)) or
+    !isEmpty(
+        (vars.request.items default [])
+            filter ((item) -&gt;
+                if (not (item is Object)) true
+                else if (isEmpty(item.sku default '')) true
+                else if (not (item.quantity is Number)) true
+                else (item.quantity &lt;= 0) or floor(item.quantity) != item.quantity
+            )
+    )
+]">
+				<set-payload value="#[output application/json
+var hasInvalidQuantity = !isEmpty((vars.request.items default []) filter ((item) -&gt; 
+    (item is Object) and (item.quantity == null or not (item.quantity is Number) or item.quantity &lt;= 0 or floor(item.quantity) != item.quantity)
+))
+var badItem = ((vars.request.items default []) filter ((item) -&gt; 
+    (item is Object) and (item.quantity == null or not (item.quantity is Number) or item.quantity &lt;= 0 or floor(item.quantity) != item.quantity)
+))[0] default {}
+---
+{
+    errorCode: if (hasInvalidQuantity) 'INVALID_QUANTITY' else 'INVALID_REQUEST',
+    message: if (hasInvalidQuantity) 'Quantity must be a positive integer.' else 'correlationId, sagaId, stepId, orderId and a non-empty items array are required',
+    (sku: badItem.sku) if (!isEmpty(badItem.sku default '')),
+    correlationId: vars.request.correlationId default null,
+    sagaId: vars.request.sagaId default null,
+    stepId: vars.request.stepId default null,
+    stepName: vars.request.stepName default 'RESERVE_INVENTORY',
+    attempt: vars.request.attempt default 1,
+    outcome: 'FAILURE',
+    completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
+    failureType: 'BUSINESS',
+    failureCode: if (hasInvalidQuantity) 'INVALID_QUANTITY' else 'INVALID_REQUEST',
+    failureMessage: if (hasInvalidQuantity) 'Quantity must be a positive integer.' else 'correlationId, sagaId, stepId, orderId and a non-empty items array are required',
+    retryable: false
+}]" doc:name="Invalid request payload" />
+			</when>
+			<otherwise>
+				<set-variable variableName="command" value="#[output application/java ---
+{
+    correlationId: vars.request.correlationId,
+    sagaId: vars.request.sagaId,
+    stepId: vars.request.stepId,
+    stepName: vars.request.stepName default 'RESERVE_INVENTORY',
+    commandType: 'RESERVE',
+    attempt: vars.request.attempt default 1,
+    payload: {
+        orderId: vars.request.orderId,
+        items: vars.request.items
+    }
+}]" doc:name="Build reserve command" />
+				<flow-ref doc:name="Reserve sub-flow" name="inventory-reserver-Sub_Flow" />
+				<ee:transform doc:name="Reply to JSON">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</otherwise>
+		</choice>
+
+		<!-- Publish Success or Handled Business Failure Reply back to Saga Orchestrator -->
+		<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish inventory.reserve.reply">
+			<amqp:routing-keys>
+				<amqp:routing-key value="#[vars.request.replyTo default 'inventory.reserve.reply']" />
+			</amqp:routing-keys>
+			<amqp:message>
+				<amqp:body>#[payload]</amqp:body>
+				<amqp:properties correlationId="#[vars.request.correlationId default correlationId]" />
+			</amqp:message>
+		</amqp:publish>
+
+		<error-handler>
+			<on-error-continue type="ANY" logException="true">
+				<flow-ref name="inventory-handle-duplicate-race-sub-flow" doc:name="Handle Race or Format Error" />
+				<ee:transform doc:name="Format Exception Reply">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+				<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish Error Reply">
+					<amqp:routing-keys>
+						<amqp:routing-key value="#[vars.request.replyTo default 'inventory.reserve.reply']" />
+					</amqp:routing-keys>
+					<amqp:message>
+						<amqp:body>#[payload]</amqp:body>
+						<amqp:properties correlationId="#[vars.request.correlationId default correlationId]" />
+					</amqp:message>
+				</amqp:publish>
+			</on-error-continue>
+		</error-handler>
+	</flow>
+
+	<!-- 2. AMQP Listener: Release Inventory Command (Compensation) -->
+	<flow name="inventory-release-amqp-flow">
+		<amqp:listener doc:name="Listen inventory.release.command"
+			config-ref="RabbitMQ_Config"
+			queueName="inventory.release.command"
+			ackMode="AUTO"
+			outputMimeType="application/json">
+			<amqp:fallback-queue-definition removalStrategy="EXPLICIT" />
+		</amqp:listener>
+
+		<set-variable variableName="request" value="#[output application/java
+var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
+var body = if (raw.payload is String) read(raw.payload, 'application/json') else (raw.payload default raw)
+var resolvedOrderId = raw.orderId default body.orderId default null
+var resolvedReservationId = raw.reservationId default body.reservationId default null
+var resolvedReservationIds = if (body.reservationIds is String) read(body.reservationIds, 'application/json') else (raw.reservationIds default body.reservationIds default [])
+---
+raw ++ {
+    correlationId: raw.correlationId default attributes.properties.correlationId default correlationId,
+    sagaId: raw.sagaId default body.sagaId default 'SAGA-UNKNOWN',
+    stepId: raw.stepId default body.stepId default 'STEP-UNKNOWN',
+    replyTo: raw.replyTo default attributes.properties.replyTo default 'inventory.release.reply',
+    orderId: resolvedOrderId,
+    reservationId: resolvedReservationId,
+    reservationIds: resolvedReservationIds
+}]" doc:name="Save release request" />
+
+		<choice doc:name="Validate release request">
+			<when expression="#[
+    isEmpty(vars.request.correlationId default '') or
+    isEmpty(vars.request.sagaId default '') or
+    isEmpty(vars.request.stepId default '') or
+    (isEmpty(vars.request.reservationId default '') and isEmpty(vars.request.reservationIds default []) and isEmpty(vars.request.orderId default ''))
+]">
+				<set-payload value="#[output application/json ---
+{
+    correlationId: vars.request.correlationId default null,
+    sagaId: vars.request.sagaId default null,
+    stepId: vars.request.stepId default null,
+    stepName: 'RELEASE_INVENTORY',
+    attempt: vars.request.attempt default 1,
+    outcome: 'FAILURE',
+    completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
+    failureType: 'BUSINESS',
+    failureCode: 'INVALID_REQUEST',
+    failureMessage: 'correlationId, sagaId, stepId and one of reservationId, reservationIds or orderId are required',
+    retryable: false
+}]" doc:name="Invalid request payload" />
+			</when>
+			<otherwise>
+				<set-variable variableName="command" value="#[output application/java ---
+{
+    correlationId: vars.request.correlationId,
+    sagaId: vars.request.sagaId,
+    stepId: vars.request.stepId,
+    stepName: 'RELEASE_INVENTORY',
+    commandType: 'RELEASE',
+    attempt: vars.request.attempt default 1,
+    payload: {
+        orderId: vars.request.orderId default null,
+        reservationIds: if (!isEmpty(vars.request.reservationIds default []))
+                            vars.request.reservationIds
+                        else if (!isEmpty(vars.request.reservationId default ''))
+                            [vars.request.reservationId]
+                        else
+                            []
+    }
+}]" doc:name="Build release command" />
+				<set-variable variableName="dedupKey" value="#[(vars.command.sagaId as String) ++ ':' ++ (vars.command.stepId as String) ++ ':RELEASE']" doc:name="Set dedupKey" />
+
+				<flow-ref doc:name="Release sub-flow" name="inventory-release-Sub_Flow" />
+				<ee:transform doc:name="Reply to JSON">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</otherwise>
+		</choice>
+
+		<!-- Publish Release Reply back to Saga Orchestrator -->
+		<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish inventory.release.reply">
+			<amqp:routing-keys>
+				<amqp:routing-key value="#[vars.request.replyTo default 'inventory.release.reply']" />
+			</amqp:routing-keys>
+			<amqp:message>
+				<amqp:body>#[payload]</amqp:body>
+				<amqp:properties correlationId="#[vars.request.correlationId default correlationId]" />
+			</amqp:message>
+		</amqp:publish>
+
+		<error-handler>
+			<on-error-continue type="ANY" logException="true">
+				<flow-ref name="inventory-handle-duplicate-race-sub-flow" doc:name="Handle Race or Format Error" />
+				<ee:transform doc:name="Format Exception Reply">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+				<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish Error Reply">
+					<amqp:routing-keys>
+						<amqp:routing-key value="#[vars.request.replyTo default 'inventory.release.reply']" />
+					</amqp:routing-keys>
+					<amqp:message>
+						<amqp:body>#[payload]</amqp:body>
+						<amqp:properties correlationId="#[vars.request.correlationId default correlationId]" />
+					</amqp:message>
+				</amqp:publish>
 			</on-error-continue>
 		</error-handler>
 	</flow>
@@ -278,8 +557,8 @@ payload]]></ee:set-payload>
 if (vars.raceCheckResult[0].result_payload is Object) vars.raceCheckResult[0].result_payload
 else read(vars.raceCheckResult[0].result_payload as String, 'application/json')]" doc:name="Set racePayload" />
 						<set-variable variableName="httpStatus" value="#[if (vars.racePayload.outcome == 'SUCCESS') 200
-else if (['UNKNOWN_SKU', 'RESERVATION_NOT_FOUND'] contains (vars.racePayload.failureCode default '')) 404
-else if (['INSUFFICIENT_STOCK', 'COMMAND_IN_PROGRESS', 'INVALID_RESERVATION_STATE', 'STOCK_RESTORE_FAILED', 'RESERVATION_UPDATE_FAILED'] contains (vars.racePayload.failureCode default '')) 409
+else if (['UNKNOWN_SKU', 'RESERVATION_NOT_FOUND'] contains (vars.racePayload.failureCode default vars.racePayload.errorCode default '')) 404
+else if (['INSUFFICIENT_STOCK', 'INSUFFICIENT_QUANTITY', 'COMMAND_IN_PROGRESS', 'INVALID_RESERVATION_STATE', 'STOCK_RESTORE_FAILED', 'RESERVATION_UPDATE_FAILED'] contains (vars.racePayload.failureCode default vars.racePayload.errorCode default '')) 409
 else if (vars.racePayload.retryable default false) 503
 else 400]" doc:name="Set race status" />
 						<set-payload value="#[vars.racePayload]" doc:name="Set race result payload" />
@@ -321,30 +600,13 @@ payload]]></ee:set-payload>
 	<!-- ===================== RESERVE SUB-FLOW ===================== -->
 	<sub-flow name="inventory-reserver-Sub_Flow">
 		<choice doc:name="Validate reserve command">
-			<when expression="#[
-    isEmpty(vars.command.correlationId default '') or
-    isEmpty(vars.command.sagaId default '') or
-    isEmpty(vars.command.stepId default '') or
-    isEmpty(vars.command.payload.orderId default '') or
-    (vars.command.commandType default '') != 'RESERVE' or
-    not (vars.command.payload.items is Array) or
-    isEmpty(vars.command.payload.items default [])
-]">
+			<when expression="#[isEmpty(vars.command.correlationId default '') or&#10;    isEmpty(vars.command.sagaId default '') or&#10;    isEmpty(vars.command.stepId default '') or&#10;    isEmpty(vars.command.payload.orderId default '') or&#10;    (vars.command.commandType default '') != 'RESERVE' or&#10;    not (vars.command.payload.items is Array) or&#10;    isEmpty(vars.command.payload.items default [])]">
 				<raise-error type="INVENTORY:INVALID_COMMAND" description="Reserve command requires correlationId, sagaId, stepId, commandType RESERVE, orderId and a non-empty items array" />
 			</when>
 		</choice>
 
 		<choice doc:name="Validate reserve items">
-			<when expression="#[
-    !isEmpty(
-        vars.command.payload.items filter ((item) -&gt;
-            if (not (item is Object)) true
-            else if (isEmpty(item.sku default '')) true
-            else if (not (item.quantity is Number)) true
-            else (item.quantity &lt;= 0) or floor(item.quantity) != item.quantity
-        )
-    )
-]">
+			<when expression="#[!isEmpty(&#10; vars.command.payload.items filter ((item) -&gt;&#10;if (not (item is Object)) true&#10;else if (isEmpty(item.sku default '')) true&#10;else if (not (item.quantity is Number)) true&#10;else (item.quantity &lt;= 0) or floor(item.quantity) != item.quantity&#10;        )&#10;    )]">
 				<raise-error type="INVENTORY:INVALID_ITEM" description="Each item must contain a SKU and a positive whole-number quantity" />
 			</when>
 		</choice>
@@ -394,18 +656,26 @@ else
 							<when expression="#[vars.reserveFailure == null and isEmpty(vars.stockRows default [])]">
 								<set-variable variableName="reserveFailure" value="#[output application/java ---
 {
+    errorCode: 'UNKNOWN_SKU',
+    message: 'The requested SKU does not exist.',
+    sku: vars.currentItem.sku as String,
     failureCode: 'UNKNOWN_SKU',
-    failureMessage: 'Unknown SKU ' ++ (vars.currentItem.sku as String),
+    failureMessage: 'The requested SKU does not exist.',
     retryable: false
 }]" doc:name="Record UNKNOWN_SKU" />
 							</when>
 							<when expression="#[vars.reserveFailure == null and !isEmpty(vars.stockRows default []) and (vars.currentItem.quantity as Number) &gt; (vars.stockRows[0].available_quantity as Number)]">
 								<set-variable variableName="reserveFailure" value="#[output application/java ---
 {
-    failureCode: 'INSUFFICIENT_STOCK',
-    failureMessage: 'Insufficient stock for SKU ' ++ (vars.currentItem.sku as String),
+    errorCode: 'INSUFFICIENT_QUANTITY',
+    message: 'Requested quantity exceeds available stock.',
+    sku: vars.currentItem.sku as String,
+    requestedQuantity: vars.currentItem.quantity as Number,
+    availableQuantity: vars.stockRows[0].available_quantity as Number,
+    failureCode: 'INSUFFICIENT_QUANTITY',
+    failureMessage: 'Requested quantity exceeds available stock.',
     retryable: false
-}]" doc:name="Record INSUFFICIENT_STOCK" />
+}]" doc:name="Record INSUFFICIENT_QUANTITY" />
 							</when>
 						</choice>
 					</foreach>
@@ -414,6 +684,11 @@ else
 						<when expression="#[vars.reserveFailure != null]">
 							<set-variable variableName="inventoryReply" value="#[output application/java ---
 {
+    errorCode: vars.reserveFailure.errorCode,
+    message: vars.reserveFailure.message,
+    (sku: vars.reserveFailure.sku) if (vars.reserveFailure.sku != null),
+    (requestedQuantity: vars.reserveFailure.requestedQuantity) if (vars.reserveFailure.requestedQuantity != null),
+    (availableQuantity: vars.reserveFailure.availableQuantity) if (vars.reserveFailure.availableQuantity != null),
     correlationId: vars.command.correlationId,
     sagaId: vars.command.sagaId,
     stepId: vars.command.stepId,
@@ -442,7 +717,7 @@ WHERE sku = :sku
 								</db:update>
 								<choice doc:name="Ensure stock update succeeded">
 									<when expression="#[((if (vars.stockUpdateResult is Number) vars.stockUpdateResult else vars.stockUpdateResult.affectedRows) default 0) &lt;= 0]">
-										<raise-error type="INVENTORY:INSUFFICIENT_STOCK" description="Stock changed before the reservation could be completed" />
+										<raise-error type="INVENTORY:INSUFFICIENT_QUANTITY" description="Stock changed before the reservation could be completed" />
 									</when>
 								</choice>
 								<db:insert doc:name="Insert reservation" config-ref="Database_Config">
@@ -468,6 +743,7 @@ WHERE sku = :sku
     outcome: 'SUCCESS',
     completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
     result: {
+        orderId: vars.command.payload.orderId,
         reservationId: vars.reservationResults[0].reservationId,
         reservationStatus: 'RESERVED',
         expiresAt: vars.reservationResults[0].expiresAt,

@@ -8,9 +8,9 @@ types:
   ChargeRequest:
     type: object
     properties:
-      correlationId: string
-      sagaId: string
-      stepId: string
+      correlationId?: string
+      sagaId?: string
+      stepId?: string
       stepName?: string
       attempt?: integer
       orderId: string
@@ -21,9 +21,9 @@ types:
   RefundRequest:
     type: object
     properties:
-      correlationId: string
-      sagaId: string
-      stepId: string
+      correlationId?: string
+      sagaId?: string
+      stepId?: string
       stepName?: string
       attempt?: integer
       paymentId?: string

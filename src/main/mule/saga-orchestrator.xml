@@ -1,0 +1,1078 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:tls="http://www.mulesoft.org/schema/mule/tls"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:amqp="http://www.mulesoft.org/schema/mule/amqp"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/amqp http://www.mulesoft.org/schema/mule/amqp/current/mule-amqp.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/tls http://www.mulesoft.org/schema/mule/tls/current/mule-tls.xsd">
+
+    <!-- Global Configurations -->
+    <configuration-properties doc:name="Configuration properties" file="config.yaml" />
+
+    <http:listener-config name="Saga_HTTP_Listener_config">
+        <http:listener-connection host="0.0.0.0" port="${http.port}" />
+    </http:listener-config>
+
+    <apikit:config name="saga-process-api-config" 
+                   api="api/saga-process-api.raml" 
+                   outboundHeadersMapName="outboundHeaders" 
+                   httpStatusVarName="httpStatus" />
+
+    <tls:context name="CloudAMQP_TLS">
+        <tls:trust-store insecure="true" />
+    </tls:context>
+
+    <amqp:config name="RabbitMQ_Config" doc:name="AMQP Config">
+        <amqp:connection
+            host="${amqp.host}"
+            port="${amqp.port}"
+            virtualHost="${amqp.virtualHost}"
+            username="${amqp.username}"
+            password="${amqp.password}"
+            useTls="true"
+            tlsContext="CloudAMQP_TLS" />
+    </amqp:config>
+
+    <db:config name="Saga_Database_Config" doc:name="Database Config">
+        <db:my-sql-connection 
+            host="${db.host}" 
+            port="${db.port}" 
+            user="${db.user}" 
+            password="${db.password}" 
+            database="${database.saga}">
+            <reconnection>
+                <reconnect count="3"/>
+            </reconnection>
+        </db:my-sql-connection>
+    </db:config>
+
+    <!-- ================================================================= -->
+    <!-- HTTP INGRESS ROUTER                                               -->
+    <!-- ================================================================= -->
+    <flow name="saga-process-api-main">
+        <http:listener config-ref="Saga_HTTP_Listener_config" path="/api/v1/*">
+            <http:response statusCode="#[vars.httpStatus default 200]">
+                <http:headers>#[vars.outboundHeaders default {}]</http:headers>
+            </http:response>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body>#[payload]</http:body>
+                <http:headers>#[vars.outboundHeaders default {}]</http:headers>
+            </http:error-response>
+        </http:listener>
+        <apikit:router config-ref="saga-process-api-config" />
+        <error-handler ref="global-error-handler" />
+    </flow>
+
+    <!-- ================================================================= -->
+    <!-- POST /api/v1/sagas/order-fulfilment (Saga Initiation)             -->
+    <!-- ================================================================= -->
+    <flow name="post:\sagas\order-fulfilment:application\json:saga-process-api-config">
+        <set-variable variableName="inboundReq" value="#[payload]" doc:name="Save Incoming Order Payload" />
+        <set-variable variableName="corrId" value="#[correlationId default uuid()]" doc:name="Set correlationId" />
+
+        <!-- Check for Duplicate Initiation -->
+        <db:select config-ref="Saga_Database_Config" target="existingSaga" doc:name="Query Existing Saga By OrderId">
+            <db:sql><![CDATA[SELECT saga_id, saga_state, correlation_id FROM saga_instances WHERE saga_type = 'ORDER_FULFILMENT' AND order_id = :orderId]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ orderId: vars.inboundReq.orderId }]]]></db:input-parameters>
+        </db:select>
+
+        <choice doc:name="Saga Exists?">
+            <when expression="#[!isEmpty(vars.existingSaga default [])]">
+                <set-variable variableName="httpStatus" value="409" doc:name="Set Status 409 Conflict" />
+                <ee:transform doc:name="Duplicate Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    errorCode: "DUPLICATE_ORDER_ID",
+    message: "A saga instance already exists for orderId: " ++ (vars.inboundReq.orderId as String),
+    sagaId: vars.existingSaga[0].saga_id,
+    orderId: vars.inboundReq.orderId,
+    sagaState: vars.existingSaga[0].saga_state,
+    statusUrl: "/api/v1/sagas/" ++ (vars.existingSaga[0].saga_id as String),
+    correlationId: vars.existingSaga[0].correlation_id
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <otherwise>
+                <!-- Generate Identifiers -->
+                <set-variable variableName="sagaId" value="#['SAGA-' ++ (now() as String {format: 'yyyy'}) ++ '-' ++ (uuid()[0 to 6])]" doc:name="Generate sagaId" />
+
+                <!-- Insert Durable Saga State in Transaction -->
+                <try doc:name="Durable Initiation Tx" transactionalAction="ALWAYS_BEGIN" transactionType="LOCAL">
+                    <db:insert config-ref="Saga_Database_Config" doc:name="Insert saga_instances">
+                        <db:sql><![CDATA[INSERT INTO saga_instances (saga_id, saga_type, order_id, customer_id, request_payload, saga_state, current_step, state_version, correlation_id, started_at) 
+VALUES (:sagaId, 'ORDER_FULFILMENT', :orderId, :customerId, :requestPayload, 'STARTED', 0, 1, :corrId, CURRENT_TIMESTAMP)]]></db:sql>
+                        <db:input-parameters><![CDATA[#[{
+    sagaId: vars.sagaId,
+    orderId: vars.inboundReq.orderId,
+    customerId: vars.inboundReq.customerId,
+    requestPayload: write(vars.inboundReq, 'application/json'),
+    corrId: vars.corrId
+}]]]></db:input-parameters>
+                    </db:insert>
+
+                    <!-- Pre-seed Step Rows -->
+                    <db:insert config-ref="Saga_Database_Config" doc:name="Seed Step 1">
+                        <db:sql><![CDATA[INSERT INTO saga_steps (step_id, saga_id, step_sequence, step_name, step_state, compensation_state) VALUES (:stepId, :sagaId, 1, 'RESERVE_INVENTORY', 'NOT_STARTED', 'NOT_REQUIRED')]]></db:sql>
+                        <db:input-parameters><![CDATA[#[{ stepId: vars.sagaId ++ "-STEP-1", sagaId: vars.sagaId }]]]></db:input-parameters>
+                    </db:insert>
+                    <db:insert config-ref="Saga_Database_Config" doc:name="Seed Step 2">
+                        <db:sql><![CDATA[INSERT INTO saga_steps (step_id, saga_id, step_sequence, step_name, step_state, compensation_state) VALUES (:stepId, :sagaId, 2, 'CHARGE_PAYMENT', 'NOT_STARTED', 'NOT_REQUIRED')]]></db:sql>
+                        <db:input-parameters><![CDATA[#[{ stepId: vars.sagaId ++ "-STEP-2", sagaId: vars.sagaId }]]]></db:input-parameters>
+                    </db:insert>
+                    <db:insert config-ref="Saga_Database_Config" doc:name="Seed Step 3">
+                        <db:sql><![CDATA[INSERT INTO saga_steps (step_id, saga_id, step_sequence, step_name, step_state, compensation_state) VALUES (:stepId, :sagaId, 3, 'DISPATCH_SHIPPING', 'NOT_STARTED', 'NOT_REQUIRED')]]></db:sql>
+                        <db:input-parameters><![CDATA[#[{ stepId: vars.sagaId ++ "-STEP-3", sagaId: vars.sagaId }]]]></db:input-parameters>
+                    </db:insert>
+                </try>
+
+                <!-- Dispatch Step 1 over AMQP -->
+                <flow-ref name="saga-dispatch-step1-subflow" doc:name="Invoke Step 1 Dispatch" />
+
+                <!-- Await Saga Terminal Outcome (up to 45 seconds for debugging/live execution) -->
+                <try doc:name="Await Terminal Outcome">
+                    <until-successful maxRetries="45" millisBetweenRetries="1000" doc:name="Until Saga Reaches Terminal State">
+                        <db:select config-ref="Saga_Database_Config" target="terminalSaga" doc:name="Query Terminal State">
+                            <db:sql><![CDATA[SELECT saga_id, order_id, saga_state, failure_code, failure_message FROM saga_instances WHERE saga_id = :sagaId AND saga_state IN ('COMPLETED', 'COMPENSATED', 'COMPENSATION_FAILED')]]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ sagaId: vars.sagaId }]]]></db:input-parameters>
+                        </db:select>
+                        <choice doc:name="Is Terminal?">
+                            <when expression="#[!isEmpty(vars.terminalSaga default [])]">
+                                <logger level="DEBUG" doc:name="Terminal State Reached" message="#['[SAGA] Terminal state reached: ' ++ (vars.terminalSaga[0].saga_state default '')]" />
+                            </when>
+                            <otherwise>
+                                <raise-error type="SAGA:IN_PROGRESS" description="Saga in progress" />
+                            </otherwise>
+                        </choice>
+                    </until-successful>
+                    <error-handler>
+                        <on-error-continue type="ANY" logException="false">
+                            <logger level="WARN" doc:name="Timeout Waiting for Terminal" message="#['[SAGA] Timed out waiting for saga: ' ++ (vars.sagaId default '') ++ ', falling back to 202 Accepted']" />
+                        </on-error-continue>
+                    </error-handler>
+                </try>
+
+                <choice doc:name="Check Outcome Status">
+                    <!-- 1. SAGA COMPLETED SUCCESSFULLY (200 OK) -->
+                    <when expression="#[!isEmpty(vars.terminalSaga default []) and vars.terminalSaga[0].saga_state == 'COMPLETED']">
+                        <set-variable variableName="httpStatus" value="200" doc:name="Status 200 OK" />
+                        <db:select config-ref="Saga_Database_Config" target="stepRows" doc:name="Select Saga Steps">
+                            <db:sql><![CDATA[SELECT step_sequence, step_name, step_state, attempt_count, compensation_state, failure_code, command_sent_at, reply_received_at, compensated_at FROM saga_steps WHERE saga_id = :sagaId ORDER BY step_sequence ASC]]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ sagaId: vars.sagaId }]]]></db:input-parameters>
+                        </db:select>
+                        <ee:transform doc:name="Success Response">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var inst = vars.terminalSaga[0]
+---
+{
+    sagaId: inst.saga_id,
+    orderId: inst.order_id,
+    sagaState: "COMPLETED",
+    message: "Order fulfilled and all saga steps completed successfully.",
+    correlationId: vars.corrId,
+    steps: (vars.stepRows default []) map (row) -> {
+        stepSequence: row.step_sequence,
+        stepName: row.step_name,
+        stepState: row.step_state,
+        attemptCount: row.attempt_count,
+        compensationState: row.compensation_state,
+        startedAt: row.command_sent_at as String default null,
+        completedAt: row.reply_received_at as String default null
+    }
+}]]></ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+                    </when>
+
+                    <!-- 2. SAGA FAILED / COMPENSATED (404 for Unknown SKU, 409 for Insufficient Stock / Other Failures) -->
+                    <when expression="#[!isEmpty(vars.terminalSaga default []) and (vars.terminalSaga[0].saga_state == 'COMPENSATED' or vars.terminalSaga[0].saga_state == 'COMPENSATION_FAILED')]">
+                        <set-variable variableName="httpStatus" value="#[if (vars.terminalSaga[0].failure_code == 'UNKNOWN_SKU') 404 else 409]" doc:name="Set Status Error" />
+                        <db:select config-ref="Saga_Database_Config" target="stepRows" doc:name="Select Saga Steps">
+                            <db:sql><![CDATA[SELECT step_sequence, step_name, step_state, attempt_count, compensation_state, failure_code, command_sent_at, reply_received_at, compensated_at FROM saga_steps WHERE saga_id = :sagaId ORDER BY step_sequence ASC]]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ sagaId: vars.sagaId }]]]></db:input-parameters>
+                        </db:select>
+                        <ee:transform doc:name="Error Response">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var inst = vars.terminalSaga[0]
+var code = inst.failure_code default "ORDER_FULFILMENT_FAILED"
+var msg = inst.failure_message default "Saga execution failed and compensating actions were executed."
+---
+{
+    errorCode: code,
+    message: msg,
+    sagaId: inst.saga_id,
+    orderId: inst.order_id,
+    sagaState: inst.saga_state,
+    failureCode: code,
+    failureMessage: msg,
+    correlationId: vars.corrId,
+    steps: (vars.stepRows default []) map (row) -> {
+        stepSequence: row.step_sequence,
+        stepName: row.step_name,
+        stepState: row.step_state,
+        attemptCount: row.attempt_count,
+        compensationState: row.compensation_state,
+        (failureCode: row.failure_code) if (!isEmpty(row.failure_code default '')),
+        startedAt: row.command_sent_at as String default null,
+        completedAt: row.reply_received_at as String default null,
+        compensatedAt: row.compensated_at as String default null
+    }
+}]]></ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+                    </when>
+
+                    <!-- 3. FALLBACK IF STILL PROCESSING (202 ACCEPTED) -->
+                    <otherwise>
+                        <set-variable variableName="httpStatus" value="202" doc:name="Set Status 202" />
+                        <ee:transform doc:name="Fallback 202 Response">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    sagaId: vars.sagaId,
+    orderId: vars.inboundReq.orderId,
+    sagaState: "STEP_IN_PROGRESS",
+    statusUrl: "/api/v1/sagas/" ++ vars.sagaId,
+    correlationId: vars.corrId
+}]]></ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+                    </otherwise>
+                </choice>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- ================================================================= -->
+    <!-- GET /api/v1/sagas/{sagaId} (Status Inspection)                    -->
+    <!-- ================================================================= -->
+    <flow name="get:\sagas\(sagaId):saga-process-api-config">
+        <set-variable variableName="lookupSagaId" value="#[attributes.uriParams.sagaId]" doc:name="Get sagaId" />
+        <db:select config-ref="Saga_Database_Config" target="sagaInstance" doc:name="Select Saga Instance">
+            <db:sql><![CDATA[SELECT saga_id, order_id, saga_state, correlation_id, failure_code, failure_message, started_at, completed_at FROM saga_instances WHERE saga_id = :sagaId]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ sagaId: vars.lookupSagaId }]]]></db:input-parameters>
+        </db:select>
+
+        <choice doc:name="Found?">
+            <when expression="#[isEmpty(vars.sagaInstance default [])]">
+                <set-variable variableName="httpStatus" value="404" doc:name="Status 404" />
+                <ee:transform doc:name="404 Payload">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    errorCode: "SAGA_NOT_FOUND",
+    message: "No saga instance found for ID " ++ (vars.lookupSagaId as String),
+    timestamp: now()
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <otherwise>
+                <db:select config-ref="Saga_Database_Config" target="stepRows" doc:name="Select Saga Steps">
+                    <db:sql><![CDATA[SELECT step_sequence, step_name, step_state, attempt_count, compensation_state, failure_code, command_sent_at, reply_received_at, compensated_at, result_payload FROM saga_steps WHERE saga_id = :sagaId ORDER BY step_sequence ASC]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ sagaId: vars.lookupSagaId }]]]></db:input-parameters>
+                </db:select>
+                <ee:transform doc:name="Format Full Status Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var inst = vars.sagaInstance[0]
+---
+{
+    sagaId: inst.saga_id,
+    orderId: inst.order_id,
+    sagaState: inst.saga_state,
+    correlationId: inst.correlation_id,
+    failureCode: inst.failure_code,
+    failureMessage: inst.failure_message,
+    startedAt: inst.started_at as String,
+    completedAt: inst.completed_at as String default null,
+    steps: (vars.stepRows default []) map (row) -> {
+        stepSequence: row.step_sequence,
+        stepName: row.step_name,
+        stepState: row.step_state,
+        attemptCount: row.attempt_count,
+        (result: if (!isEmpty(row.result_payload default '')) read(row.result_payload as String, 'application/json') else null) if (!isEmpty(row.result_payload default '')),
+        compensationState: row.compensation_state,
+        (failureCode: row.failure_code) if (!isEmpty(row.failure_code default '')),
+        startedAt: row.command_sent_at as String default null,
+        completedAt: row.reply_received_at as String default null,
+        compensatedAt: row.compensated_at as String default null
+    }
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- ================================================================= -->
+    <!-- STEP 1: RESERVE INVENTORY                                         -->
+    <!-- ================================================================= -->
+    <sub-flow name="saga-dispatch-step1-subflow">
+        <db:update config-ref="Saga_Database_Config" doc:name="Mark Step 1 In Progress">
+            <db:sql><![CDATA[UPDATE saga_steps SET step_state = 'STEP_IN_PROGRESS', attempt_count = attempt_count + 1, command_sent_at = CURRENT_TIMESTAMP, timeout_at = TIMESTAMPADD(SECOND, :timeoutSec, CURRENT_TIMESTAMP) WHERE saga_id = :sagaId AND step_sequence = 1]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ sagaId: vars.sagaId, timeoutSec: (p('saga.timeoutSeconds') default 30) as Number }]]]></db:input-parameters>
+        </db:update>
+        <db:update config-ref="Saga_Database_Config" doc:name="Update Saga current_step = 1">
+            <db:sql><![CDATA[UPDATE saga_instances SET saga_state = 'STEP_IN_PROGRESS', current_step = 1 WHERE saga_id = :sagaId]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ sagaId: vars.sagaId }]]]></db:input-parameters>
+        </db:update>
+
+        <!-- Publish Command -->
+        <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish inventory.reserve.command">
+            <amqp:routing-keys>
+                <amqp:routing-key value="${queues.inventory.command}" />
+            </amqp:routing-keys>
+            <amqp:message>
+                <amqp:body><![CDATA[#[output application/json
+---
+{
+    correlationId: vars.corrId,
+    sagaId: vars.sagaId,
+    stepId: vars.sagaId ++ "-STEP-1",
+    stepName: "RESERVE_INVENTORY",
+    commandType: "RESERVE",
+    attempt: 1,
+    issuedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"},
+    replyTo: p('queues.inventory.reply'),
+    payload: {
+        orderId: vars.inboundReq.orderId,
+        items: vars.inboundReq.items map ((i) -> { sku: i.sku, quantity: i.quantity })
+    }
+}]]]></amqp:body>
+            </amqp:message>
+        </amqp:publish>
+    </sub-flow>
+
+    <!-- Reply Listener: Inventory -->
+    <flow name="inventory-reserve-reply-listener-flow">
+        <amqp:listener config-ref="RabbitMQ_Config" queueName="${queues.inventory.reply}" ackMode="AUTO" outputMimeType="application/json" doc:name="Listen inventory.reserve.reply">
+            <amqp:fallback-queue-definition removalStrategy="EXPLICIT" />
+        </amqp:listener>
+
+        <set-variable variableName="reply" value="#[payload]" doc:name="Save Reply" />
+        <logger level="INFO" doc:name="Log Inventory Reply" message="#['[SAGA] Received inventory reply for: ' ++ (vars.reply.sagaId default '') ++ ' outcome: ' ++ (vars.reply.outcome default '')]" />
+
+        <choice doc:name="Outcome SUCCESS?">
+            <when expression="#[vars.reply.outcome == 'SUCCESS']">
+                <db:update config-ref="Saga_Database_Config" target="step1UpdateResult" doc:name="Mark Step 1 COMPLETED">
+                    <db:sql><![CDATA[UPDATE saga_steps SET step_state = 'STEP_COMPLETED', reply_received_at = CURRENT_TIMESTAMP, result_payload = :resultPayload WHERE step_id = :stepId AND step_state = 'STEP_IN_PROGRESS']]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ stepId: vars.reply.stepId, resultPayload: write(vars.reply.result, 'application/json') }]]]></db:input-parameters>
+                </db:update>
+                <choice doc:name="Step 1 State Transitioned?">
+                    <when expression="#[((if (vars.step1UpdateResult is Number) vars.step1UpdateResult else vars.step1UpdateResult.affectedRows) default 0) &gt; 0]">
+                        <!-- Advance to Step 2: Payment -->
+                        <flow-ref name="saga-dispatch-step2-subflow" doc:name="Trigger Step 2" />
+                    </when>
+                    <otherwise>
+                        <logger level="WARN" doc:name="Duplicate or Standalone Step 1 Reply" 
+                                message="#['[SAGA] Step 1 update affected 0 rows (duplicate reply or standalone test). StepId: ' ++ (vars.reply.stepId default '') ++ ', sagaId: ' ++ (vars.reply.sagaId default '')]" />
+                    </otherwise>
+                </choice>
+            </when>
+            <otherwise>
+                <!-- Check if failure is retryable (AC 7 / NS 10) -->
+                <db:select config-ref="Saga_Database_Config" target="step1Record" doc:name="Check Step 1 Attempt">
+                    <db:sql><![CDATA[SELECT attempt_count FROM saga_steps WHERE step_id = :stepId]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ stepId: vars.reply.stepId }]]]></db:input-parameters>
+                </db:select>
+                <choice doc:name="Can Retry Step 1?">
+                    <when expression="#[(vars.reply.retryable default false) and ((vars.step1Record[0].attempt_count default 1) &lt; (p('saga.maxRetries') default 3) as Number)]">
+                        <!-- Increment attempt count, update timeout and republish -->
+                        <db:update config-ref="Saga_Database_Config" doc:name="Increment Step 1 Attempt">
+                            <db:sql><![CDATA[UPDATE saga_steps SET attempt_count = attempt_count + 1, command_sent_at = CURRENT_TIMESTAMP, timeout_at = TIMESTAMPADD(SECOND, :timeoutSec, CURRENT_TIMESTAMP) WHERE step_id = :stepId]]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ stepId: vars.reply.stepId, timeoutSec: (p('saga.timeoutSeconds') default 30) as Number }]]]></db:input-parameters>
+                        </db:update>
+                        <logger level="WARN" doc:name="Log Step 1 Retry" message="#['[SAGA_RETRY] Step 1 retryable failure received. Retrying attempt ' ++ (((vars.step1Record[0].attempt_count default 1) as Number) + 1) ++ ' for saga: ' ++ (vars.reply.sagaId default '')]" />
+                        <db:select config-ref="Saga_Database_Config" target="saga1Row" doc:name="Get Saga 1 Payload">
+                            <db:sql><![CDATA[SELECT request_payload, correlation_id FROM saga_instances WHERE saga_id = :sagaId]]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId }]]]></db:input-parameters>
+                        </db:select>
+                        <set-variable variableName="orig1" value="#[read(vars.saga1Row[0].request_payload, 'application/json')]" doc:name="Parse Req" />
+                        <amqp:publish config-ref="RabbitMQ_Config" doc:name="Republish inventory.reserve.command">
+                            <amqp:routing-keys>
+                                <amqp:routing-key value="${queues.inventory.command}" />
+                            </amqp:routing-keys>
+                            <amqp:message>
+                                <amqp:body><![CDATA[#[output application/json
+---
+{
+    correlationId: vars.saga1Row[0].correlation_id,
+    sagaId: vars.reply.sagaId,
+    stepId: vars.reply.stepId,
+    stepName: "RESERVE_INVENTORY",
+    commandType: "RESERVE",
+    attempt: ((vars.step1Record[0].attempt_count default 1) as Number) + 1,
+    issuedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"},
+    replyTo: p('queues.inventory.reply'),
+    payload: {
+        orderId: vars.orig1.orderId,
+        items: vars.orig1.items map ((i) -> { sku: i.sku, quantity: i.quantity })
+    }
+}]]]></amqp:body>
+                            </amqp:message>
+                        </amqp:publish>
+                    </when>
+                    <otherwise>
+                        <!-- Non-retryable or max retries exhausted: Mark Step 1 FAILED and Saga COMPENSATED -->
+                        <db:update config-ref="Saga_Database_Config" target="step1FailResult" doc:name="Mark Step 1 FAILED">
+                            <db:sql><![CDATA[UPDATE saga_steps SET step_state = 'FAILED', failure_code = :failCode, reply_received_at = CURRENT_TIMESTAMP WHERE step_id = :stepId AND step_state = 'STEP_IN_PROGRESS']]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ stepId: vars.reply.stepId, failCode: vars.reply.failureCode default 'INSUFFICIENT_STOCK' }]]]></db:input-parameters>
+                        </db:update>
+                        <choice doc:name="Step 1 Failed Transitioned?">
+                            <when expression="#[((if (vars.step1FailResult is Number) vars.step1FailResult else vars.step1FailResult.affectedRows) default 0) &gt; 0]">
+                                <db:update config-ref="Saga_Database_Config" doc:name="Mark Saga COMPENSATED (Zero compensations needed)">
+                                    <db:sql><![CDATA[UPDATE saga_instances SET saga_state = 'COMPENSATED', failure_code = :failCode, failure_message = :failMsg, completed_at = CURRENT_TIMESTAMP WHERE saga_id = :sagaId AND saga_state = 'STEP_IN_PROGRESS']]></db:sql>
+                                    <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId, failCode: vars.reply.failureCode default 'INSUFFICIENT_STOCK', failMsg: vars.reply.failureMessage default 'Inventory unavailable' }]]]></db:input-parameters>
+                                </db:update>
+                            </when>
+                            <otherwise>
+                                <logger level="WARN" doc:name="Duplicate or Standalone Step 1 Failure" 
+                                        message="#['[SAGA] Step 1 failure update affected 0 rows. StepId: ' ++ (vars.reply.stepId default '') ++ ', sagaId: ' ++ (vars.reply.sagaId default '')]" />
+                            </otherwise>
+                        </choice>
+                    </otherwise>
+                </choice>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- ================================================================= -->
+    <!-- STEP 2: CHARGE PAYMENT                                            -->
+    <!-- ================================================================= -->
+    <sub-flow name="saga-dispatch-step2-subflow">
+        <db:select config-ref="Saga_Database_Config" target="sagaRow" doc:name="Fetch Original Request Payload">
+            <db:sql><![CDATA[SELECT request_payload, correlation_id FROM saga_instances WHERE saga_id = :sagaId]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId }]]]></db:input-parameters>
+        </db:select>
+        <choice doc:name="Saga Instance Found?">
+            <when expression="#[!isEmpty(vars.sagaRow default []) and !isEmpty(vars.sagaRow[0].request_payload default null)]">
+                <set-variable variableName="origPayload" value="#[read(vars.sagaRow[0].request_payload, 'application/json')]" doc:name="Parse Original Payload" />
+
+                <db:update config-ref="Saga_Database_Config" doc:name="Mark Step 2 In Progress">
+                    <db:sql><![CDATA[UPDATE saga_steps SET step_state = 'STEP_IN_PROGRESS', attempt_count = attempt_count + 1, command_sent_at = CURRENT_TIMESTAMP, timeout_at = TIMESTAMPADD(SECOND, :timeoutSec, CURRENT_TIMESTAMP) WHERE saga_id = :sagaId AND step_sequence = 2]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId, timeoutSec: (p('saga.timeoutSeconds') default 30) as Number }]]]></db:input-parameters>
+                </db:update>
+                <db:update config-ref="Saga_Database_Config" doc:name="Update current_step = 2">
+                    <db:sql><![CDATA[UPDATE saga_instances SET current_step = 2 WHERE saga_id = :sagaId]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId }]]]></db:input-parameters>
+                </db:update>
+
+                <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish payment.charge.command">
+                    <amqp:routing-keys>
+                        <amqp:routing-key value="${queues.payment.command}" />
+                    </amqp:routing-keys>
+                    <amqp:message>
+                        <amqp:body><![CDATA[#[output application/json
+---
+{
+    correlationId: vars.sagaRow[0].correlation_id,
+    sagaId: vars.reply.sagaId,
+    stepId: vars.reply.sagaId ++ "-STEP-2",
+    stepName: "CHARGE_PAYMENT",
+    commandType: "CHARGE",
+    attempt: 1,
+    issuedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"},
+    replyTo: p('queues.payment.reply'),
+    payload: {
+        orderId: vars.origPayload.orderId,
+        amount: vars.origPayload.totalAmount,
+        currency: vars.origPayload.currency default "INR",
+        cardToken: vars.origPayload.payment.cardToken
+    }
+}]]]></amqp:body>
+                    </amqp:message>
+                </amqp:publish>
+            </when>
+            <otherwise>
+                <logger level="WARN" doc:name="No Saga Instance Found" 
+                        message="#['[SAGA] No saga_instances found for sagaId: ' ++ (vars.reply.sagaId default 'NULL') ++ '. Cannot dispatch Step 2.']" />
+            </otherwise>
+        </choice>
+    </sub-flow>
+
+    <!-- Reply Listener: Payment -->
+    <flow name="payment-charge-reply-listener-flow">
+        <amqp:listener config-ref="RabbitMQ_Config" queueName="${queues.payment.reply}" ackMode="AUTO" outputMimeType="application/json" doc:name="Listen payment.charge.reply">
+            <amqp:fallback-queue-definition removalStrategy="EXPLICIT" />
+        </amqp:listener>
+
+        <set-variable variableName="reply" value="#[payload]" doc:name="Save Payment Reply" />
+        <logger level="INFO" doc:name="Log Payment Reply" message="#['[SAGA] Received payment reply for: ' ++ (vars.reply.sagaId default '') ++ ' outcome: ' ++ (vars.reply.outcome default '')]" />
+
+        <choice doc:name="Payment Outcome?">
+            <when expression="#[vars.reply.outcome == 'SUCCESS']">
+                <db:update config-ref="Saga_Database_Config" target="step2UpdateResult" doc:name="Mark Step 2 COMPLETED">
+                    <db:sql><![CDATA[UPDATE saga_steps SET step_state = 'STEP_COMPLETED', reply_received_at = CURRENT_TIMESTAMP, result_payload = :resultPayload WHERE step_id = :stepId AND step_state = 'STEP_IN_PROGRESS']]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ stepId: vars.reply.stepId, resultPayload: write(vars.reply.result, 'application/json') }]]]></db:input-parameters>
+                </db:update>
+                <choice doc:name="Step 2 Transitioned?">
+                    <when expression="#[((if (vars.step2UpdateResult is Number) vars.step2UpdateResult else vars.step2UpdateResult.affectedRows) default 0) &gt; 0]">
+                        <!-- Advance to Step 3: Shipping -->
+                        <flow-ref name="saga-dispatch-step3-subflow" doc:name="Trigger Step 3" />
+                    </when>
+                    <otherwise>
+                        <logger level="WARN" doc:name="Duplicate or Standalone Step 2 Reply" 
+                                message="#['[SAGA] Step 2 update affected 0 rows (duplicate reply or standalone test). StepId: ' ++ (vars.reply.stepId default '')]" />
+                    </otherwise>
+                </choice>
+            </when>
+            <otherwise>
+                <!-- Check if failure is retryable (AC 7 / NS 10) -->
+                <db:select config-ref="Saga_Database_Config" target="step2Record" doc:name="Check Step 2 Attempt">
+                    <db:sql><![CDATA[SELECT attempt_count FROM saga_steps WHERE step_id = :stepId]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ stepId: vars.reply.stepId }]]]></db:input-parameters>
+                </db:select>
+                <choice doc:name="Can Retry Step 2?">
+                    <when expression="#[(vars.reply.retryable default false) and ((vars.step2Record[0].attempt_count default 1) &lt; (p('saga.maxRetries') default 3) as Number)]">
+                        <!-- Increment attempt count, update timeout and republish -->
+                        <db:update config-ref="Saga_Database_Config" doc:name="Increment Step 2 Attempt">
+                            <db:sql><![CDATA[UPDATE saga_steps SET attempt_count = attempt_count + 1, command_sent_at = CURRENT_TIMESTAMP, timeout_at = TIMESTAMPADD(SECOND, :timeoutSec, CURRENT_TIMESTAMP) WHERE step_id = :stepId]]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ stepId: vars.reply.stepId, timeoutSec: (p('saga.timeoutSeconds') default 30) as Number }]]]></db:input-parameters>
+                        </db:update>
+                        <logger level="WARN" doc:name="Log Step 2 Retry" message="#['[SAGA_RETRY] Step 2 retryable failure received. Retrying attempt ' ++ (((vars.step2Record[0].attempt_count default 1) as Number) + 1) ++ ' for saga: ' ++ (vars.reply.sagaId default '')]" />
+                        <db:select config-ref="Saga_Database_Config" target="saga2Row" doc:name="Get Saga 2 Payload">
+                            <db:sql><![CDATA[SELECT request_payload, correlation_id FROM saga_instances WHERE saga_id = :sagaId]]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId }]]]></db:input-parameters>
+                        </db:select>
+                        <set-variable variableName="orig2" value="#[read(vars.saga2Row[0].request_payload, 'application/json')]" doc:name="Parse Req" />
+                        <amqp:publish config-ref="RabbitMQ_Config" doc:name="Republish payment.charge.command">
+                            <amqp:routing-keys>
+                                <amqp:routing-key value="${queues.payment.command}" />
+                            </amqp:routing-keys>
+                            <amqp:message>
+                                <amqp:body><![CDATA[#[output application/json
+---
+{
+    correlationId: vars.saga2Row[0].correlation_id,
+    sagaId: vars.reply.sagaId,
+    stepId: vars.reply.stepId,
+    stepName: "CHARGE_PAYMENT",
+    commandType: "CHARGE",
+    attempt: ((vars.step2Record[0].attempt_count default 1) as Number) + 1,
+    issuedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"},
+    replyTo: p('queues.payment.reply'),
+    payload: {
+        orderId: vars.orig2.orderId,
+        amount: vars.orig2.totalAmount,
+        currency: vars.orig2.currency default "INR",
+        cardToken: vars.orig2.payment.cardToken
+    }
+}]]]></amqp:body>
+                            </amqp:message>
+                        </amqp:publish>
+                    </when>
+                    <otherwise>
+                        <!-- Non-retryable or max retries exhausted: Mark Step 2 FAILED and initiate backward compensation -->
+                        <db:update config-ref="Saga_Database_Config" target="step2FailResult" doc:name="Mark Step 2 FAILED">
+                            <db:sql><![CDATA[UPDATE saga_steps SET step_state = 'FAILED', failure_code = :failCode, reply_received_at = CURRENT_TIMESTAMP WHERE step_id = :stepId AND step_state = 'STEP_IN_PROGRESS']]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ stepId: vars.reply.stepId, failCode: vars.reply.failureCode default 'PAYMENT_DECLINED' }]]]></db:input-parameters>
+                        </db:update>
+                        <choice doc:name="Step 2 Failure Transitioned?">
+                            <when expression="#[((if (vars.step2FailResult is Number) vars.step2FailResult else vars.step2FailResult.affectedRows) default 0) &gt; 0]">
+                                <db:update config-ref="Saga_Database_Config" doc:name="Update Saga COMPENSATING">
+                                    <db:sql><![CDATA[UPDATE saga_instances SET saga_state = 'COMPENSATING', failure_code = :failCode, failure_message = :failMsg WHERE saga_id = :sagaId AND saga_state = 'STEP_IN_PROGRESS']]></db:sql>
+                                    <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId, failCode: vars.reply.failureCode default 'PAYMENT_DECLINED', failMsg: vars.reply.failureMessage default 'Payment charge failed' }]]]></db:input-parameters>
+                                </db:update>
+                                <flow-ref name="saga-compensate-inventory-subflow" doc:name="Compensate Inventory" />
+                            </when>
+                            <otherwise>
+                                <logger level="WARN" doc:name="Duplicate Step 2 Failure" 
+                                        message="#['[SAGA] Step 2 failure update affected 0 rows. StepId: ' ++ (vars.reply.stepId default '')]" />
+                            </otherwise>
+                        </choice>
+                    </otherwise>
+                </choice>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- ================================================================= -->
+    <!-- STEP 3: DISPATCH SHIPPING                                         -->
+    <!-- ================================================================= -->
+    <sub-flow name="saga-dispatch-step3-subflow">
+        <db:select config-ref="Saga_Database_Config" target="sagaRow" doc:name="Fetch Original Request Payload">
+            <db:sql><![CDATA[SELECT request_payload, correlation_id FROM saga_instances WHERE saga_id = :sagaId]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId }]]]></db:input-parameters>
+        </db:select>
+        <choice doc:name="Saga Instance Found?">
+            <when expression="#[!isEmpty(vars.sagaRow default []) and !isEmpty(vars.sagaRow[0].request_payload default null)]">
+                <set-variable variableName="origPayload" value="#[read(vars.sagaRow[0].request_payload, 'application/json')]" doc:name="Parse Payload" />
+
+                <db:update config-ref="Saga_Database_Config" doc:name="Mark Step 3 In Progress">
+                    <db:sql><![CDATA[UPDATE saga_steps SET step_state = 'STEP_IN_PROGRESS', attempt_count = attempt_count + 1, command_sent_at = CURRENT_TIMESTAMP, timeout_at = TIMESTAMPADD(SECOND, :timeoutSec, CURRENT_TIMESTAMP) WHERE saga_id = :sagaId AND step_sequence = 3]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId, timeoutSec: (p('saga.timeoutSeconds') default 30) as Number }]]]></db:input-parameters>
+                </db:update>
+                <db:update config-ref="Saga_Database_Config" doc:name="Update current_step = 3">
+                    <db:sql><![CDATA[UPDATE saga_instances SET current_step = 3 WHERE saga_id = :sagaId]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId }]]]></db:input-parameters>
+                </db:update>
+
+                <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish shipping.dispatch.command">
+                    <amqp:routing-keys>
+                        <amqp:routing-key value="${queues.shipping.command}" />
+                    </amqp:routing-keys>
+                    <amqp:message>
+                        <amqp:body><![CDATA[#[output application/json
+---
+{
+    correlationId: vars.sagaRow[0].correlation_id,
+    sagaId: vars.reply.sagaId,
+    stepId: vars.reply.sagaId ++ "-STEP-3",
+    stepName: "DISPATCH_SHIPPING",
+    commandType: "DISPATCH",
+    attempt: 1,
+    issuedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"},
+    replyTo: p('queues.shipping.reply'),
+    payload: {
+        orderId: vars.origPayload.orderId,
+        shippingAddress: vars.origPayload.shipping
+    }
+}]]]></amqp:body>
+                    </amqp:message>
+                </amqp:publish>
+            </when>
+            <otherwise>
+                <logger level="WARN" doc:name="No Saga Instance Found" 
+                        message="#['[SAGA] No saga_instances found for sagaId: ' ++ (vars.reply.sagaId default 'NULL') ++ '. Cannot dispatch Step 3.']" />
+            </otherwise>
+        </choice>
+    </sub-flow>
+
+    <!-- Reply Listener: Shipping -->
+    <flow name="shipping-dispatch-reply-listener-flow">
+        <amqp:listener config-ref="RabbitMQ_Config" queueName="${queues.shipping.reply}" ackMode="AUTO" outputMimeType="application/json" doc:name="Listen shipping.dispatch.reply">
+            <amqp:fallback-queue-definition removalStrategy="EXPLICIT" />
+        </amqp:listener>
+
+        <set-variable variableName="reply" value="#[payload]" doc:name="Save Shipping Reply" />
+        <logger level="INFO" doc:name="Log Shipping Reply" message="#['[SAGA] Received shipping reply for: ' ++ (vars.reply.sagaId default '') ++ ' outcome: ' ++ (vars.reply.outcome default '')]" />
+
+        <choice doc:name="Shipping Outcome?">
+            <when expression="#[vars.reply.outcome == 'SUCCESS']">
+                <!-- ALL 3 STEPS COMPLETED -->
+                <db:update config-ref="Saga_Database_Config" target="step3UpdateResult" doc:name="Mark Step 3 COMPLETED">
+                    <db:sql><![CDATA[UPDATE saga_steps SET step_state = 'STEP_COMPLETED', reply_received_at = CURRENT_TIMESTAMP, result_payload = :resultPayload WHERE step_id = :stepId AND step_state = 'STEP_IN_PROGRESS']]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ stepId: vars.reply.stepId, resultPayload: write(vars.reply.result, 'application/json') }]]]></db:input-parameters>
+                </db:update>
+                <choice doc:name="Step 3 Transitioned?">
+                    <when expression="#[((if (vars.step3UpdateResult is Number) vars.step3UpdateResult else vars.step3UpdateResult.affectedRows) default 0) &gt; 0]">
+                        <db:update config-ref="Saga_Database_Config" doc:name="Mark Saga COMPLETED">
+                            <db:sql><![CDATA[UPDATE saga_instances SET saga_state = 'COMPLETED', completed_at = CURRENT_TIMESTAMP WHERE saga_id = :sagaId AND saga_state = 'STEP_IN_PROGRESS']]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId }]]]></db:input-parameters>
+                        </db:update>
+                        <logger level="INFO" doc:name="Log Terminal Completion" message="#['[SAGA_TERMINAL_SUCCESS] Saga fully completed: ' ++ vars.reply.sagaId]" />
+                    </when>
+                    <otherwise>
+                        <logger level="WARN" doc:name="Duplicate Step 3 Reply" 
+                                message="#['[SAGA] Step 3 update affected 0 rows (duplicate reply). StepId: ' ++ (vars.reply.stepId default '')]" />
+                    </otherwise>
+                </choice>
+            </when>
+            <otherwise>
+                <!-- Check if failure is retryable (AC 7 / NS 10) -->
+                <db:select config-ref="Saga_Database_Config" target="step3Record" doc:name="Check Step 3 Attempt">
+                    <db:sql><![CDATA[SELECT attempt_count FROM saga_steps WHERE step_id = :stepId]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ stepId: vars.reply.stepId }]]]></db:input-parameters>
+                </db:select>
+                <choice doc:name="Can Retry Step 3?">
+                    <when expression="#[(vars.reply.retryable default false) and ((vars.step3Record[0].attempt_count default 1) &lt; (p('saga.maxRetries') default 3) as Number)]">
+                        <!-- Increment attempt count, update timeout and republish -->
+                        <db:update config-ref="Saga_Database_Config" doc:name="Increment Step 3 Attempt">
+                            <db:sql><![CDATA[UPDATE saga_steps SET attempt_count = attempt_count + 1, command_sent_at = CURRENT_TIMESTAMP, timeout_at = TIMESTAMPADD(SECOND, :timeoutSec, CURRENT_TIMESTAMP) WHERE step_id = :stepId]]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ stepId: vars.reply.stepId, timeoutSec: (p('saga.timeoutSeconds') default 30) as Number }]]]></db:input-parameters>
+                        </db:update>
+                        <logger level="WARN" doc:name="Log Step 3 Retry" message="#['[SAGA_RETRY] Step 3 retryable failure received. Retrying attempt ' ++ (((vars.step3Record[0].attempt_count default 1) as Number) + 1) ++ ' for saga: ' ++ (vars.reply.sagaId default '')]" />
+                        <db:select config-ref="Saga_Database_Config" target="saga3Row" doc:name="Get Saga 3 Payload">
+                            <db:sql><![CDATA[SELECT request_payload, correlation_id FROM saga_instances WHERE saga_id = :sagaId]]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId }]]]></db:input-parameters>
+                        </db:select>
+                        <set-variable variableName="orig3" value="#[read(vars.saga3Row[0].request_payload, 'application/json')]" doc:name="Parse Req" />
+                        <amqp:publish config-ref="RabbitMQ_Config" doc:name="Republish shipping.dispatch.command">
+                            <amqp:routing-keys>
+                                <amqp:routing-key value="${queues.shipping.command}" />
+                            </amqp:routing-keys>
+                            <amqp:message>
+                                <amqp:body><![CDATA[#[output application/json
+---
+{
+    correlationId: vars.saga3Row[0].correlation_id,
+    sagaId: vars.reply.sagaId,
+    stepId: vars.reply.stepId,
+    stepName: "DISPATCH_SHIPPING",
+    commandType: "DISPATCH",
+    attempt: ((vars.step3Record[0].attempt_count default 1) as Number) + 1,
+    issuedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"},
+    replyTo: p('queues.shipping.reply'),
+    payload: {
+        orderId: vars.orig3.orderId,
+        shippingAddress: vars.orig3.shipping
+    }
+}]]]></amqp:body>
+                            </amqp:message>
+                        </amqp:publish>
+                    </when>
+                    <otherwise>
+                        <!-- Non-retryable or max retries exhausted: Unwind Step 2 (Refund Payment) first, then Step 1 -->
+                        <db:update config-ref="Saga_Database_Config" target="step3FailResult" doc:name="Mark Step 3 FAILED">
+                            <db:sql><![CDATA[UPDATE saga_steps SET step_state = 'FAILED', failure_code = :failCode, reply_received_at = CURRENT_TIMESTAMP WHERE step_id = :stepId AND step_state = 'STEP_IN_PROGRESS']]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ stepId: vars.reply.stepId, failCode: vars.reply.failureCode default 'SERVICE_UNAVAILABLE' }]]]></db:input-parameters>
+                        </db:update>
+                        <choice doc:name="Step 3 Failure Transitioned?">
+                            <when expression="#[((if (vars.step3FailResult is Number) vars.step3FailResult else vars.step3FailResult.affectedRows) default 0) &gt; 0]">
+                                <db:update config-ref="Saga_Database_Config" doc:name="Update Saga COMPENSATING">
+                                    <db:sql><![CDATA[UPDATE saga_instances SET saga_state = 'COMPENSATING', failure_code = :failCode, failure_message = :failMsg WHERE saga_id = :sagaId AND saga_state = 'STEP_IN_PROGRESS']]></db:sql>
+                                    <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId, failCode: vars.reply.failureCode default 'SERVICE_UNAVAILABLE', failMsg: vars.reply.failureMessage default 'Shipping dispatch failed' }]]]></db:input-parameters>
+                                </db:update>
+                                <flow-ref name="saga-compensate-payment-subflow" doc:name="Trigger Reverse Compensation: Refund" />
+                            </when>
+                            <otherwise>
+                                <logger level="WARN" doc:name="Duplicate Step 3 Failure" 
+                                        message="#['[SAGA] Step 3 failure update affected 0 rows. StepId: ' ++ (vars.reply.stepId default '')]" />
+                            </otherwise>
+                        </choice>
+                    </otherwise>
+                </choice>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- ================================================================= -->
+    <!-- COMPENSATION SUBFLOWS & LISTENERS (REVERSE ORDER)                 -->
+    <!-- ================================================================= -->
+
+    <!-- Compensation Step 2: Refund Payment -->
+    <sub-flow name="saga-compensate-payment-subflow">
+        <db:select config-ref="Saga_Database_Config" target="step2Result" doc:name="Get Step 2 Result Payload">
+            <db:sql><![CDATA[SELECT result_payload, saga_id FROM saga_steps WHERE saga_id = :sagaId AND step_sequence = 2 AND step_state = 'STEP_COMPLETED']]></db:sql>
+            <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId }]]]></db:input-parameters>
+        </db:select>
+
+        <choice doc:name="Payment Result Exists?">
+            <when expression="#[!isEmpty(vars.step2Result default [])]">
+                <set-variable variableName="payResult" value="#[read(vars.step2Result[0].result_payload, 'application/json')]" doc:name="Parse Result" />
+                <db:update config-ref="Saga_Database_Config" doc:name="Set Step 2 Compensation State">
+                    <db:sql><![CDATA[UPDATE saga_steps SET compensation_state = 'COMPENSATING', compensation_attempts = compensation_attempts + 1 WHERE saga_id = :sagaId AND step_sequence = 2]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ sagaId: vars.reply.sagaId }]]]></db:input-parameters>
+                </db:update>
+                <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish payment.refund.command">
+                    <amqp:routing-keys>
+                        <amqp:routing-key value="${queues.payment.compensate}" />
+                    </amqp:routing-keys>
+                    <amqp:message>
+                        <amqp:body><![CDATA[#[output application/json
+---
+{
+    correlationId: correlationId,
+    sagaId: vars.reply.sagaId,
+    stepId: vars.reply.sagaId ++ "-STEP-2",
+    stepName: "REFUND_PAYMENT",
+    commandType: "REFUND",
+    attempt: 1,
+    replyTo: p('queues.payment.compensateReply'),
+    payload: {
+        paymentId: vars.payResult.paymentId,
+        orderId: vars.payResult.orderId,
+        reason: "SAGA_COMPENSATION"
+    }
+}]]]></amqp:body>
+                    </amqp:message>
+                </amqp:publish>
+            </when>
+            <otherwise>
+                <!-- If payment was never charged, skip directly to inventory compensation -->
+                <flow-ref name="saga-compensate-inventory-subflow" doc:name="Directly Release Inventory" />
+            </otherwise>
+        </choice>
+    </sub-flow>
+
+    <!-- Reply Listener: Payment Refund -->
+    <flow name="payment-refund-reply-listener-flow">
+        <amqp:listener config-ref="RabbitMQ_Config" queueName="${queues.payment.compensateReply}" ackMode="AUTO" outputMimeType="application/json" doc:name="Listen payment.refund.reply">
+            <amqp:fallback-queue-definition removalStrategy="EXPLICIT" />
+        </amqp:listener>
+
+        <set-variable variableName="refundReply" value="#[payload]" doc:name="Save Refund Reply" />
+        <choice doc:name="Refund Success?">
+            <when expression="#[vars.refundReply.outcome == 'SUCCESS']">
+                <db:update config-ref="Saga_Database_Config" target="refundUpdateResult" doc:name="Mark Step 2 COMPENSATED">
+                    <db:sql><![CDATA[UPDATE saga_steps SET compensation_state = 'COMPENSATED', compensated_at = CURRENT_TIMESTAMP WHERE step_id = :stepId AND compensation_state = 'COMPENSATING']]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ stepId: vars.refundReply.stepId }]]]></db:input-parameters>
+                </db:update>
+                <choice doc:name="Step 2 Compensated Transitioned?">
+                    <when expression="#[((if (vars.refundUpdateResult is Number) vars.refundUpdateResult else vars.refundUpdateResult.affectedRows) default 0) &gt; 0]">
+                        <!-- Proceed to unwind Step 1 (Inventory) -->
+                        <flow-ref name="saga-compensate-inventory-subflow" doc:name="Compensate Inventory Next" />
+                    </when>
+                    <otherwise>
+                        <logger level="WARN" doc:name="Duplicate Refund Reply" 
+                                message="#['[SAGA] Step 2 refund update affected 0 rows (duplicate reply). StepId: ' ++ (vars.refundReply.stepId default '')]" />
+                    </otherwise>
+                </choice>
+            </when>
+            <otherwise>
+                <!-- Exhausted Retries -> Send to DLQ -->
+                <flow-ref name="saga-route-to-dlq-subflow" doc:name="Route to DLQ" />
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- Compensation Step 1: Release Inventory -->
+    <sub-flow name="saga-compensate-inventory-subflow">
+        <set-variable variableName="activeSagaId" value="#[vars.refundReply.sagaId default vars.reply.sagaId default vars.activeSagaId default vars.sagaId]" doc:name="Resolve sagaId" />
+        <db:select config-ref="Saga_Database_Config" target="step1Result" doc:name="Get Step 1 Reservation Payload">
+            <db:sql><![CDATA[SELECT result_payload FROM saga_steps WHERE saga_id = :sagaId AND step_sequence = 1 AND step_state = 'STEP_COMPLETED']]></db:sql>
+            <db:input-parameters><![CDATA[#[{ sagaId: vars.activeSagaId }]]]></db:input-parameters>
+        </db:select>
+
+        <choice doc:name="Reservation Exists?">
+            <when expression="#[!isEmpty(vars.step1Result default []) and !isEmpty(vars.step1Result[0].result_payload default null)]">
+                <set-variable variableName="invResult" value="#[read(vars.step1Result[0].result_payload, 'application/json')]" doc:name="Parse Result" />
+                <db:update config-ref="Saga_Database_Config" doc:name="Set Step 1 Compensation State">
+                    <db:sql><![CDATA[UPDATE saga_steps SET compensation_state = 'COMPENSATING', compensation_attempts = compensation_attempts + 1 WHERE saga_id = :sagaId AND step_sequence = 1]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ sagaId: vars.activeSagaId }]]]></db:input-parameters>
+                </db:update>
+                <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish inventory.release.command">
+                    <amqp:routing-keys>
+                        <amqp:routing-key value="${queues.inventory.compensate}" />
+                    </amqp:routing-keys>
+                    <amqp:message>
+                        <amqp:body><![CDATA[#[output application/json
+---
+{
+    correlationId: correlationId,
+    sagaId: vars.activeSagaId,
+    stepId: vars.activeSagaId ++ "-STEP-1",
+    stepName: "RELEASE_INVENTORY",
+    commandType: "RELEASE",
+    attempt: 1,
+    replyTo: p('queues.inventory.compensateReply'),
+    payload: {
+        orderId: vars.invResult.orderId default null,
+        reservationId: vars.invResult.reservationId default null,
+        reservationIds: if (!isEmpty(vars.invResult.reservationIds default [])) vars.invResult.reservationIds else if (!isEmpty(vars.invResult.reservationId default '')) [vars.invResult.reservationId] else [],
+        reason: "SAGA_COMPENSATION"
+    }
+}]]]></amqp:body>
+                    </amqp:message>
+                </amqp:publish>
+            </when>
+            <otherwise>
+                <db:update config-ref="Saga_Database_Config" doc:name="Mark Saga COMPENSATED Immediately">
+                    <db:sql><![CDATA[UPDATE saga_instances SET saga_state = 'COMPENSATED', completed_at = CURRENT_TIMESTAMP WHERE saga_id = :sagaId AND saga_state = 'COMPENSATING']]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ sagaId: vars.activeSagaId }]]]></db:input-parameters>
+                </db:update>
+            </otherwise>
+        </choice>
+    </sub-flow>
+
+    <!-- Reply Listener: Inventory Release -->
+    <flow name="inventory-release-reply-listener-flow">
+        <amqp:listener config-ref="RabbitMQ_Config" queueName="${queues.inventory.compensateReply}" ackMode="AUTO" outputMimeType="application/json" doc:name="Listen inventory.release.reply">
+            <amqp:fallback-queue-definition removalStrategy="EXPLICIT" />
+        </amqp:listener>
+
+        <set-variable variableName="relReply" value="#[payload]" doc:name="Save Release Reply" />
+        <choice doc:name="Release Success?">
+            <when expression="#[vars.relReply.outcome == 'SUCCESS']">
+                <db:update config-ref="Saga_Database_Config" target="releaseUpdateResult" doc:name="Mark Step 1 COMPENSATED">
+                    <db:sql><![CDATA[UPDATE saga_steps SET compensation_state = 'COMPENSATED', compensated_at = CURRENT_TIMESTAMP WHERE step_id = :stepId AND compensation_state = 'COMPENSATING']]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ stepId: vars.relReply.stepId }]]]></db:input-parameters>
+                </db:update>
+                <choice doc:name="Step 1 Compensated Transitioned?">
+                    <when expression="#[((if (vars.releaseUpdateResult is Number) vars.releaseUpdateResult else vars.releaseUpdateResult.affectedRows) default 0) &gt; 0]">
+                        <!-- Terminal COMPENSATED State -->
+                        <db:update config-ref="Saga_Database_Config" doc:name="Mark Saga Instance COMPENSATED">
+                            <db:sql><![CDATA[UPDATE saga_instances SET saga_state = 'COMPENSATED', completed_at = CURRENT_TIMESTAMP WHERE saga_id = :sagaId AND saga_state = 'COMPENSATING']]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ sagaId: vars.relReply.sagaId }]]]></db:input-parameters>
+                        </db:update>
+                        <logger level="WARN" doc:name="Log Terminal Compensated" message="#['[SAGA_TERMINAL_COMPENSATED] All completed steps reversed for saga: ' ++ vars.relReply.sagaId]" />
+                    </when>
+                    <otherwise>
+                        <logger level="WARN" doc:name="Duplicate Release Reply" 
+                                message="#['[SAGA] Step 1 release update affected 0 rows (duplicate reply). StepId: ' ++ (vars.relReply.stepId default '')]" />
+                    </otherwise>
+                </choice>
+            </when>
+            <otherwise>
+                <flow-ref name="saga-route-to-dlq-subflow" doc:name="Route to DLQ" />
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- Dead-Letter Queue Publishing for Broken Compensation -->
+    <sub-flow name="saga-route-to-dlq-subflow">
+        <set-variable variableName="failedSagaId" value="#[payload.sagaId default vars.activeSagaId]" doc:name="Get failedSagaId" />
+        <db:update config-ref="Saga_Database_Config" doc:name="Mark COMPENSATION_FAILED">
+            <db:sql><![CDATA[UPDATE saga_instances SET saga_state = 'COMPENSATION_FAILED', completed_at = CURRENT_TIMESTAMP WHERE saga_id = :sagaId]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ sagaId: vars.failedSagaId }]]]></db:input-parameters>
+        </db:update>
+        <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish to saga.dead-letter.queue">
+            <amqp:routing-keys>
+                <amqp:routing-key value="${queues.dlq}" />
+            </amqp:routing-keys>
+            <amqp:message>
+                <amqp:body><![CDATA[#[output application/json
+---
+{
+    sagaId: vars.failedSagaId,
+    correlationId: correlationId,
+    event: "COMPENSATION_FAILURE_EXHAUSTED",
+    failedPayload: payload,
+    timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"}
+}]]]></amqp:body>
+            </amqp:message>
+        </amqp:publish>
+        <logger level="ERROR" doc:name="Critical Alert" message="#['[CRITICAL_ALERT] Saga compensation failed for ' ++ (vars.failedSagaId as String) ++ '. Message sent to DLQ.']" />
+    </sub-flow>
+
+    <!-- ================================================================= -->
+    <!-- DEAD LETTER QUEUE (DLQ) LISTENER & INCIDENT AUDITOR               -->
+    <!-- Consumes unrecoverable poison messages / failed compensations     -->
+    <!-- ================================================================= -->
+    <flow name="saga-dead-letter-queue-listener-flow">
+        <amqp:listener config-ref="RabbitMQ_Config" 
+                       queueName="${queues.dlq}" 
+                       ackMode="AUTO" 
+                       numberOfConsumers="1"
+                       outputMimeType="application/json" 
+                       doc:name="Listen saga.dead-letter.queue">
+            <amqp:fallback-queue-definition removalStrategy="EXPLICIT" />
+        </amqp:listener>
+
+        <set-variable variableName="dlqMessage" value="#[payload]" doc:name="Save DLQ Message" />
+
+        <!-- Log Critical Alert for Operational / SecOps Monitoring -->
+        <logger level="ERROR" doc:name="Log Critical DLQ Incident" 
+                message="#['[CRITICAL_DLQ_ALERT] Poison/Failed saga message received from DLQ: sagaId=' ++ (vars.dlqMessage.sagaId default 'UNKNOWN') ++ ', correlationId=' ++ (vars.dlqMessage.correlationId default 'UNKNOWN') ++ ', event=' ++ (vars.dlqMessage.event default '')]" />
+
+        <!-- Update saga_instances failure audit details in Database -->
+        <db:update config-ref="Saga_Database_Config" doc:name="Audit DLQ Receipt in Database">
+            <db:sql><![CDATA[UPDATE saga_instances SET failure_code = 'DLQ_POISON_MESSAGE', failure_message = :failMsg WHERE saga_id = :sagaId]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ 
+                sagaId: vars.dlqMessage.sagaId, 
+                failMsg: 'DLQ Routed: ' ++ (vars.dlqMessage.event default 'COMPENSATION_FAILURE_EXHAUSTED') 
+            }]]]></db:input-parameters>
+        </db:update>
+
+        <logger level="INFO" doc:name="Log DLQ Audited" message="#['[DLQ_AUDIT_COMPLETE] Successfully audited DLQ message for saga: ' ++ (vars.dlqMessage.sagaId default '')]" />
+    </flow>
+
+    <!-- ================================================================= -->
+    <!-- SAGA TIMEOUT WATCHDOG FLOW (AC 5 / NS 8)                          -->
+    <!-- Periodic scheduler checking for steps exceeding timeout_at        -->
+    <!-- ================================================================= -->
+    <flow name="saga-timeout-watchdog-flow">
+        <scheduler doc:name="Check Every 10 Seconds">
+            <scheduling-strategy>
+                <fixed-frequency frequency="10" timeUnit="SECONDS" />
+            </scheduling-strategy>
+        </scheduler>
+
+        <db:select config-ref="Saga_Database_Config" target="timedOutSteps" doc:name="Find Timed-out Steps">
+            <db:sql><![CDATA[SELECT s.step_id, s.saga_id, s.step_sequence, s.step_name
+FROM saga_steps s
+JOIN saga_instances i ON s.saga_id = i.saga_id
+WHERE s.step_state = 'STEP_IN_PROGRESS'
+  AND s.timeout_at IS NOT NULL
+  AND s.timeout_at < CURRENT_TIMESTAMP
+  AND i.saga_state = 'STEP_IN_PROGRESS'
+LIMIT 5]]></db:sql>
+        </db:select>
+
+        <choice doc:name="Any Timed Out?">
+            <when expression="#[!isEmpty(vars.timedOutSteps default [])]">
+                <foreach collection="#[vars.timedOutSteps]" doc:name="Process Each Timed Out Step">
+                    <set-variable variableName="timeoutStep" value="#[payload]" doc:name="Save Timeout Step" />
+                    <logger level="WARN" doc:name="Log Timeout" 
+                            message="#['[SAGA_STEP_TIMEOUT] Step ' ++ (vars.timeoutStep.step_name default '') ++ ' timed out for saga: ' ++ (vars.timeoutStep.saga_id default '') ++ '. Initiating backward compensation.']" />
+                    
+                    <db:update config-ref="Saga_Database_Config" target="stepTimeoutResult" doc:name="Mark Step FAILED">
+                        <db:sql><![CDATA[UPDATE saga_steps SET step_state = 'FAILED', failure_code = 'STEP_TIMEOUT', reply_received_at = CURRENT_TIMESTAMP WHERE step_id = :stepId AND step_state = 'STEP_IN_PROGRESS']]></db:sql>
+                        <db:input-parameters><![CDATA[#[{ stepId: vars.timeoutStep.step_id }]]]></db:input-parameters>
+                    </db:update>
+                    
+                    <choice doc:name="Step Transitioned?">
+                        <when expression="#[((if (vars.stepTimeoutResult is Number) vars.stepTimeoutResult else vars.stepTimeoutResult.affectedRows) default 0) &gt; 0]">
+                            <db:update config-ref="Saga_Database_Config" doc:name="Mark Saga COMPENSATING">
+                                <db:sql><![CDATA[UPDATE saga_instances SET saga_state = 'COMPENSATING', failure_code = 'STEP_TIMEOUT', failure_message = 'Step execution timed out without reply' WHERE saga_id = :sagaId AND saga_state = 'STEP_IN_PROGRESS']]></db:sql>
+                                <db:input-parameters><![CDATA[#[{ sagaId: vars.timeoutStep.saga_id }]]]></db:input-parameters>
+                            </db:update>
+
+                            <choice doc:name="Which Step Timed Out?">
+                                <when expression="#[vars.timeoutStep.step_sequence == 1]">
+                                    <db:update config-ref="Saga_Database_Config" doc:name="Mark Saga COMPENSATED Immediately">
+                                        <db:sql><![CDATA[UPDATE saga_instances SET saga_state = 'COMPENSATED', completed_at = CURRENT_TIMESTAMP WHERE saga_id = :sagaId AND saga_state = 'COMPENSATING']]></db:sql>
+                                        <db:input-parameters><![CDATA[#[{ sagaId: vars.timeoutStep.saga_id }]]]></db:input-parameters>
+                                    </db:update>
+                                </when>
+                                <when expression="#[vars.timeoutStep.step_sequence == 2]">
+                                    <set-variable variableName="activeSagaId" value="#[vars.timeoutStep.saga_id]" doc:name="Set activeSagaId" />
+                                    <flow-ref name="saga-compensate-inventory-subflow" doc:name="Compensate Step 1" />
+                                </when>
+                                <otherwise>
+                                    <set-variable variableName="reply" value="#[{ sagaId: vars.timeoutStep.saga_id }]" doc:name="Set reply" />
+                                    <flow-ref name="saga-compensate-payment-subflow" doc:name="Compensate Step 2 and 1" />
+                                </otherwise>
+                            </choice>
+                        </when>
+                    </choice>
+                </foreach>
+            </when>
+        </choice>
+    </flow>
+
+    <!-- ================================================================= -->
+    <!-- SAGA STUCK MONITORING FLOW (FR 15 / NS 17)                        -->
+    <!-- Periodic monitor detecting sagas in progress > threshold          -->
+    <!-- ================================================================= -->
+    <flow name="saga-stuck-monitoring-flow">
+        <scheduler doc:name="Check Every 30 Seconds">
+            <scheduling-strategy>
+                <fixed-frequency frequency="30" timeUnit="SECONDS" />
+            </scheduling-strategy>
+        </scheduler>
+
+        <db:select config-ref="Saga_Database_Config" target="stuckSagas" doc:name="Find Stuck Sagas">
+            <db:sql><![CDATA[SELECT saga_id, order_id, saga_state, current_step, started_at, TIMESTAMPDIFF(SECOND, started_at, CURRENT_TIMESTAMP) AS elapsed_seconds
+FROM saga_instances
+WHERE saga_state IN ('STARTED', 'STEP_IN_PROGRESS', 'COMPENSATING')
+  AND started_at < TIMESTAMPADD(SECOND, -:thresholdSec, CURRENT_TIMESTAMP)
+LIMIT 10]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ thresholdSec: (p('saga.stuckThresholdSeconds') default 120) as Number }]]]></db:input-parameters>
+        </db:select>
+
+        <choice doc:name="Any Stuck Sagas?">
+            <when expression="#[!isEmpty(vars.stuckSagas default [])]">
+                <foreach collection="#[vars.stuckSagas]" doc:name="Log Each Stuck Saga">
+                    <logger level="ERROR" doc:name="Log Stuck Saga Alert" 
+                            message="#['[STUCK_SAGA_ALERT] Alert: Saga stuck! sagaId=' ++ (payload.saga_id default '') ++ ', orderId=' ++ (payload.order_id default '') ++ ', state=' ++ (payload.saga_state default '') ++ ', step=' ++ (payload.current_step default '') ++ ', elapsedSeconds=' ++ (payload.elapsed_seconds default '')]" />
+                </foreach>
+            </when>
+        </choice>
+    </flow>
+
+</mule>

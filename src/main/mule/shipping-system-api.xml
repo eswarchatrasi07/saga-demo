@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+<mule xmlns:amqp="http://www.mulesoft.org/schema/mule/amqp"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
 	xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
 	xmlns:db="http://www.mulesoft.org/schema/mule/db"
 	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
@@ -13,7 +14,8 @@
 		http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
 		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
 		http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
-		http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd">
+		http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+		http://www.mulesoft.org/schema/mule/amqp http://www.mulesoft.org/schema/mule/amqp/current/mule-amqp.xsd">
 
 	<!-- ==================== GLOBAL CONFIGURATIONS ==================== -->
 	<!-- 1. Properties file loaded first -->
@@ -52,14 +54,30 @@
 		</http:listener>
 
 		<apikit:router config-ref="shipping-system-api-config" />
-
-		<!-- Centralized Error Handler replaces duplicate APIKit error handler -->
 		<error-handler ref="global-error-handler" />
 	</flow>
 
-	<!-- ==================== POST /shipping/dispatch (SAGA STEP 3) ==================== -->
+	<!-- ==================== POST /shipping/dispatch (HTTP REST) ==================== -->
 	<flow name="post:\shipping\dispatch:application\json:shipping-system-api-config">
-		<set-variable variableName="request" value="#[output application/java --- if (payload is String or payload is Binary) read(payload, 'application/json') else payload]" doc:name="Save dispatch request" />
+		<set-variable variableName="request" value="#[output application/java
+var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
+var body = raw.payload default raw
+var addr = body.shippingAddress default raw.shippingAddress default {}
+---
+raw ++ {
+    correlationId: raw.correlationId default correlationId,
+    sagaId: raw.sagaId default ('SAGA-' ++ (uuid() as String)),
+    stepId: raw.stepId default ('STEP-' ++ (uuid() as String)),
+    orderId: raw.orderId default body.orderId,
+    shippingAddress: {
+        addressLine1: addr.addressLine1 default body.addressLine1 default raw.addressLine1,
+        city: addr.city default body.city default raw.city,
+        state: addr.state default body.state default raw.state default '',
+        postalCode: addr.postalCode default body.postalCode default raw.postalCode,
+        country: addr.country default body.country default raw.country
+    },
+    serviceLevel: raw.serviceLevel default body.serviceLevel default 'STANDARD'
+}]" doc:name="Save dispatch request" />
 
 		<choice doc:name="Validate Dispatch Payload">
 			<when expression="#[
@@ -137,11 +155,21 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- ==================== POST /shipping/cancel (SAGA STEP 3 COMPENSATION) ==================== -->
+	<!-- ==================== POST /shipping/cancel (HTTP REST) ==================== -->
 	<flow name="post:\shipping\cancel:application\json:shipping-system-api-config">
-		<set-variable variableName="request" value="#[output application/java --- if (payload is String or payload is Binary) read(payload, 'application/json') else payload]" doc:name="Save cancel request" />
+		<set-variable variableName="request" value="#[output application/java
+var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
+var body = raw.payload default raw
+---
+raw ++ {
+    correlationId: raw.correlationId default correlationId,
+    sagaId: raw.sagaId default ('SAGA-' ++ (uuid() as String)),
+    stepId: raw.stepId default ('STEP-' ++ (uuid() as String)),
+    orderId: raw.orderId default body.orderId,
+    shippingId: raw.shippingId default body.shippingId
+}]" doc:name="Save cancel request" />
 
-		<choice doc:name="Validate Cancel Request">
+		<choice doc:name="Validate Cancel Payload">
 			<when expression="#[
 				isEmpty(vars.request.correlationId default '') or
 				isEmpty(vars.request.sagaId default '') or
@@ -171,12 +199,10 @@ payload]]></ee:set-payload>
 	sagaId: vars.request.sagaId,
 	stepId: vars.request.stepId,
 	stepName: vars.request.stepName default 'CANCEL_SHIPPING',
-	commandType: vars.request.commandType default 'CANCEL',
 	attempt: vars.request.attempt default 1,
 	payload: {
 		shippingId: vars.request.shippingId default null,
-		orderId: vars.request.orderId default null,
-		reason: vars.request.reason default 'SAGA_COMPENSATION'
+		orderId: vars.request.orderId default null
 	}
 }]" doc:name="Build Cancel Command" />
 
@@ -206,6 +232,246 @@ payload]]></ee:set-payload>
 		<error-handler>
 			<on-error-continue type="ANY" logException="true">
 				<flow-ref name="shipping-handle-duplicate-race-sub-flow" doc:name="Handle Shipping Duplicate Race or Delegate" />
+			</on-error-continue>
+		</error-handler>
+	</flow>
+
+	<!-- ===================================================================== -->
+	<!-- AMQP EVENT-DRIVEN FLOWS (Saga Orchestration)                          -->
+	<!-- ===================================================================== -->
+
+	<!-- 1. AMQP Listener: Dispatch Shipping Command (Saga Step 3) -->
+	<flow name="shipping-dispatch-amqp-flow">
+		<amqp:listener doc:name="Listen shipping.dispatch.command"
+			config-ref="RabbitMQ_Config"
+			queueName="shipping.dispatch.command"
+			ackMode="AUTO"
+			outputMimeType="application/json">
+			<amqp:fallback-queue-definition removalStrategy="EXPLICIT" />
+		</amqp:listener>
+
+		<set-variable variableName="request" value="#[output application/java
+var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
+var body = raw.payload default raw
+var addr = body.shippingAddress default raw.shippingAddress default {}
+---
+raw ++ {
+    correlationId: raw.correlationId default correlationId,
+    sagaId: raw.sagaId default 'SAGA-UNKNOWN',
+    stepId: raw.stepId default 'STEP-UNKNOWN',
+    replyTo: raw.replyTo default 'shipping.dispatch.reply',
+    orderId: raw.orderId default body.orderId,
+    shippingAddress: {
+        addressLine1: addr.addressLine1 default body.addressLine1 default raw.addressLine1,
+        city: addr.city default body.city default raw.city,
+        state: addr.state default body.state default raw.state default '',
+        postalCode: addr.postalCode default body.postalCode default raw.postalCode,
+        country: addr.country default body.country default raw.country
+    },
+    serviceLevel: raw.serviceLevel default body.serviceLevel default 'STANDARD'
+}]" doc:name="Save dispatch request" />
+
+		<choice doc:name="Validate Dispatch Payload">
+			<when expression="#[
+				isEmpty(vars.request.correlationId default '') or
+				isEmpty(vars.request.sagaId default '') or
+				isEmpty(vars.request.stepId default '') or
+				isEmpty(vars.request.orderId default '') or
+				isEmpty(vars.request.shippingAddress.addressLine1 default '') or
+				isEmpty(vars.request.shippingAddress.city default '') or
+				isEmpty(vars.request.shippingAddress.postalCode default '') or
+				isEmpty(vars.request.shippingAddress.country default '')
+			]">
+				<set-payload value="#[output application/json ---
+{
+	correlationId: vars.request.correlationId default null,
+	sagaId: vars.request.sagaId default null,
+	stepId: vars.request.stepId default null,
+	stepName: 'DISPATCH_SHIPPING',
+	attempt: vars.request.attempt default 1,
+	outcome: 'FAILURE',
+	completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
+	failureType: 'BUSINESS',
+	failureCode: 'INVALID_REQUEST',
+	failureMessage: 'correlationId, sagaId, stepId, orderId, and valid shippingAddress fields are required',
+	retryable: false
+}]" doc:name="Invalid Request Payload" />
+			</when>
+			<otherwise>
+				<set-variable variableName="command" value="#[output application/java ---
+{
+	correlationId: vars.request.correlationId,
+	sagaId: vars.request.sagaId,
+	stepId: vars.request.stepId,
+	stepName: vars.request.stepName default 'DISPATCH_SHIPPING',
+	commandType: vars.request.commandType default 'DISPATCH',
+	attempt: vars.request.attempt default 1,
+	payload: {
+		orderId: vars.request.orderId,
+		addressLine1: vars.request.shippingAddress.addressLine1,
+		city: vars.request.shippingAddress.city,
+		state: vars.request.shippingAddress.state default '',
+		postalCode: vars.request.shippingAddress.postalCode,
+		country: vars.request.shippingAddress.country,
+		serviceLevel: upper(vars.request.serviceLevel default 'STANDARD')
+	}
+}]" doc:name="Build Dispatch Command" />
+
+				<set-variable variableName="dedupKey" value="#[(vars.command.sagaId as String) ++ ':' ++ (vars.command.stepId as String) ++ ':DISPATCH']" doc:name="Set dedupKey" />
+
+				<flow-ref doc:name="Invoke Dispatch Sub-Flow" name="shipping-dispatch-Sub_Flow" />
+
+				<ee:transform doc:name="Reply to JSON">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</otherwise>
+		</choice>
+
+		<!-- Publish Reply back to Saga Orchestrator -->
+		<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish shipping.dispatch.reply">
+			<amqp:routing-keys>
+				<amqp:routing-key value="#[vars.request.replyTo default 'shipping.dispatch.reply']" />
+			</amqp:routing-keys>
+			<amqp:message>
+				<amqp:body>#[payload]</amqp:body>
+				<amqp:properties correlationId="#[vars.request.correlationId default correlationId]" />
+			</amqp:message>
+		</amqp:publish>
+
+		<error-handler>
+			<on-error-continue type="ANY" logException="true">
+				<flow-ref name="shipping-handle-duplicate-race-sub-flow" doc:name="Handle Shipping Race or Format Error" />
+				<ee:transform doc:name="Format Error Payload">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+				<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish Error Reply">
+					<amqp:routing-keys>
+						<amqp:routing-key value="#[vars.request.replyTo default 'shipping.dispatch.reply']" />
+					</amqp:routing-keys>
+					<amqp:message>
+						<amqp:body>#[payload]</amqp:body>
+						<amqp:properties correlationId="#[vars.request.correlationId default correlationId]" />
+					</amqp:message>
+				</amqp:publish>
+			</on-error-continue>
+		</error-handler>
+	</flow>
+
+	<!-- 2. AMQP Listener: Cancel Shipping Command (Saga Step 3 Compensation) -->
+	<flow name="shipping-cancel-amqp-flow">
+		<amqp:listener doc:name="Listen shipping.cancel.command"
+			config-ref="RabbitMQ_Config"
+			queueName="shipping.cancel.command"
+			ackMode="AUTO"
+			outputMimeType="application/json">
+			<amqp:fallback-queue-definition removalStrategy="EXPLICIT" />
+		</amqp:listener>
+
+		<set-variable variableName="request" value="#[output application/java
+var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
+var body = raw.payload default raw
+---
+raw ++ {
+    correlationId: raw.correlationId default correlationId,
+    sagaId: raw.sagaId default 'SAGA-UNKNOWN',
+    stepId: raw.stepId default 'STEP-UNKNOWN',
+    replyTo: raw.replyTo default 'shipping.cancel.reply',
+    orderId: raw.orderId default body.orderId,
+    shippingId: raw.shippingId default body.shippingId
+}]" doc:name="Save cancel request" />
+
+		<choice doc:name="Validate Cancel Payload">
+			<when expression="#[
+				isEmpty(vars.request.correlationId default '') or
+				isEmpty(vars.request.sagaId default '') or
+				isEmpty(vars.request.stepId default '') or
+				(isEmpty(vars.request.shippingId default '') and isEmpty(vars.request.orderId default ''))
+			]">
+				<set-payload value="#[output application/json ---
+{
+	correlationId: vars.request.correlationId default null,
+	sagaId: vars.request.sagaId default null,
+	stepId: vars.request.stepId default null,
+	stepName: 'CANCEL_SHIPPING',
+	attempt: vars.request.attempt default 1,
+	outcome: 'FAILURE',
+	completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
+	failureType: 'BUSINESS',
+	failureCode: 'INVALID_REQUEST',
+	failureMessage: 'correlationId, sagaId, stepId and either shippingId or orderId are required',
+	retryable: false
+}]" doc:name="Invalid Request Payload" />
+			</when>
+			<otherwise>
+				<set-variable variableName="command" value="#[output application/java ---
+{
+	correlationId: vars.request.correlationId,
+	sagaId: vars.request.sagaId,
+	stepId: vars.request.stepId,
+	stepName: vars.request.stepName default 'CANCEL_SHIPPING',
+	attempt: vars.request.attempt default 1,
+	payload: {
+		shippingId: vars.request.shippingId default null,
+		orderId: vars.request.orderId default null
+	}
+}]" doc:name="Build Cancel Command" />
+
+				<set-variable variableName="dedupKey" value="#[(vars.command.sagaId as String) ++ ':' ++ (vars.command.stepId as String) ++ ':CANCEL']" doc:name="Set dedupKey" />
+
+				<flow-ref doc:name="Invoke Cancel Sub-Flow" name="shipping-cancel-Sub_Flow" />
+
+				<ee:transform doc:name="Reply to JSON">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</otherwise>
+		</choice>
+
+		<!-- Publish Cancel Reply back to Saga Orchestrator -->
+		<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish shipping.cancel.reply">
+			<amqp:routing-keys>
+				<amqp:routing-key value="#[vars.request.replyTo default 'shipping.cancel.reply']" />
+			</amqp:routing-keys>
+			<amqp:message>
+				<amqp:body>#[payload]</amqp:body>
+				<amqp:properties correlationId="#[vars.request.correlationId default correlationId]" />
+			</amqp:message>
+		</amqp:publish>
+
+		<error-handler>
+			<on-error-continue type="ANY" logException="true">
+				<flow-ref name="shipping-handle-duplicate-race-sub-flow" doc:name="Handle Shipping Race or Format Error" />
+				<ee:transform doc:name="Format Error Payload">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+				<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish Error Reply">
+					<amqp:routing-keys>
+						<amqp:routing-key value="#[vars.request.replyTo default 'shipping.cancel.reply']" />
+					</amqp:routing-keys>
+					<amqp:message>
+						<amqp:body>#[payload]</amqp:body>
+						<amqp:properties correlationId="#[vars.request.correlationId default correlationId]" />
+					</amqp:message>
+				</amqp:publish>
 			</on-error-continue>
 		</error-handler>
 	</flow>
@@ -284,7 +550,7 @@ payload]]></ee:set-payload>
 				</when>
 				<otherwise>
 					<choice doc:name="Simulate Courier Availability">
-						<when expression="#[vars.command.payload.postalCode == '000000' or vars.command.payload.serviceLevel == 'FAIL_DISPATCH']">
+						<when expression="#[vars.command.payload.postalCode == '000000' or vars.command.payload.serviceLevel == 'FAIL_DISPATCH' or ((vars.command.payload.addressLine1 default '') startsWith 'REJECT')]">
 							<set-variable variableName="shippingReply" value="#[output application/java ---
 {
 	correlationId: vars.command.correlationId,

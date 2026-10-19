@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+<mule xmlns:amqp="http://www.mulesoft.org/schema/mule/amqp"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
 	xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
 	xmlns:db="http://www.mulesoft.org/schema/mule/db"
 	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
@@ -11,7 +12,8 @@
 		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
 		http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
 		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
-		http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+		http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+		http://www.mulesoft.org/schema/mule/amqp http://www.mulesoft.org/schema/mule/amqp/current/mule-amqp.xsd">
 
 	<!-- ==================== GLOBAL CONFIGURATIONS ==================== -->
 	<!-- 1. Properties file loaded first -->
@@ -50,14 +52,24 @@
 		</http:listener>
 
 		<apikit:router config-ref="payment-system-api-config" />
-
-		<!-- Centralized Error Handler replaces duplicate APIKit error handler -->
 		<error-handler ref="global-error-handler" />
 	</flow>
 
-	<!-- ==================== POST /payments/charge (SAGA STEP 2) ==================== -->
+	<!-- ==================== POST /payments/charge (HTTP REST) ==================== -->
 	<flow name="post:\payments\charge:application\json:payment-system-api-config">
-		<set-variable variableName="request" value="#[output application/java --- if (payload is String or payload is Binary) read(payload, 'application/json') else payload]" doc:name="Save charge request" />
+		<set-variable variableName="request" value="#[output application/java
+var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
+var body = raw.payload default raw
+---
+raw ++ {
+    correlationId: raw.correlationId default correlationId,
+    sagaId: raw.sagaId default ('SAGA-' ++ (uuid() as String)),
+    stepId: raw.stepId default ('STEP-' ++ (uuid() as String)),
+    orderId: raw.orderId default body.orderId,
+    amount: raw.amount default body.amount,
+    currency: raw.currency default body.currency,
+    cardToken: raw.cardToken default body.cardToken
+}]" doc:name="Save charge request" />
 
 		<choice doc:name="Validate Charge Payload">
 			<when expression="#[
@@ -129,9 +141,19 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- ==================== POST /payments/refund (SAGA COMPENSATION) ==================== -->
+	<!-- ==================== POST /payments/refund (HTTP REST) ==================== -->
 	<flow name="post:\payments\refund:application\json:payment-system-api-config">
-		<set-variable variableName="request" value="#[output application/java --- if (payload is String or payload is Binary) read(payload, 'application/json') else payload]" doc:name="Save refund request" />
+		<set-variable variableName="request" value="#[output application/java
+var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
+var body = raw.payload default raw
+---
+raw ++ {
+    correlationId: raw.correlationId default correlationId,
+    sagaId: raw.sagaId default ('SAGA-' ++ (uuid() as String)),
+    stepId: raw.stepId default ('STEP-' ++ (uuid() as String)),
+    orderId: raw.orderId default body.orderId,
+    paymentId: raw.paymentId default body.paymentId
+}]" doc:name="Save refund request" />
 
 		<choice doc:name="Validate Refund Request">
 			<when expression="#[
@@ -196,6 +218,234 @@ payload]]></ee:set-payload>
 		<error-handler>
 			<on-error-continue type="ANY" logException="true">
 				<flow-ref name="payment-handle-duplicate-race-sub-flow" doc:name="Handle Payment Duplicate Race or Delegate" />
+			</on-error-continue>
+		</error-handler>
+	</flow>
+
+	<!-- ===================================================================== -->
+	<!-- AMQP EVENT-DRIVEN FLOWS (Saga Orchestration)                          -->
+	<!-- ===================================================================== -->
+
+	<!-- 1. AMQP Listener: Charge Payment Command (Saga Step 2) -->
+	<flow name="payment-charge-amqp-flow">
+		<amqp:listener doc:name="Listen payment.charge.command"
+			config-ref="RabbitMQ_Config"
+			queueName="payment.charge.command"
+			ackMode="AUTO"
+			outputMimeType="application/json">
+			<amqp:fallback-queue-definition removalStrategy="EXPLICIT" />
+		</amqp:listener>
+
+		<set-variable variableName="request" value="#[output application/java
+var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
+var body = raw.payload default raw
+---
+raw ++ {
+    correlationId: raw.correlationId default correlationId,
+    sagaId: raw.sagaId default 'SAGA-UNKNOWN',
+    stepId: raw.stepId default 'STEP-UNKNOWN',
+    replyTo: raw.replyTo default 'payment.charge.reply',
+    orderId: raw.orderId default body.orderId,
+    amount: raw.amount default body.amount,
+    currency: raw.currency default body.currency,
+    cardToken: raw.cardToken default body.cardToken
+}]" doc:name="Save charge request" />
+
+		<choice doc:name="Validate Charge Payload">
+			<when expression="#[
+				isEmpty(vars.request.correlationId default '') or
+				isEmpty(vars.request.sagaId default '') or
+				isEmpty(vars.request.stepId default '') or
+				isEmpty(vars.request.orderId default '') or
+				isEmpty(vars.request.cardToken default '') or
+				(vars.request.amount == null or not (vars.request.amount is Number) or vars.request.amount &lt;= 0)
+			]">
+				<set-payload value="#[output application/json ---
+{
+	correlationId: vars.request.correlationId default null,
+	sagaId: vars.request.sagaId default null,
+	stepId: vars.request.stepId default null,
+	stepName: 'CHARGE_PAYMENT',
+	attempt: vars.request.attempt default 1,
+	outcome: 'FAILURE',
+	completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
+	failureType: 'BUSINESS',
+	failureCode: 'INVALID_REQUEST',
+	failureMessage: 'correlationId, sagaId, stepId, orderId, cardToken, and a positive amount are required',
+	retryable: false
+}]" doc:name="Invalid Request Payload" />
+			</when>
+			<otherwise>
+				<set-variable variableName="command" value="#[output application/java ---
+{
+	correlationId: vars.request.correlationId,
+	sagaId: vars.request.sagaId,
+	stepId: vars.request.stepId,
+	stepName: vars.request.stepName default 'CHARGE_PAYMENT',
+	attempt: vars.request.attempt default 1,
+	payload: {
+		orderId: vars.request.orderId,
+		amount: vars.request.amount,
+		currency: upper(vars.request.currency default 'INR'),
+		cardToken: vars.request.cardToken
+	}
+}]" doc:name="Build Charge Command" />
+
+				<set-variable variableName="dedupKey" value="#[(vars.command.sagaId as String) ++ ':' ++ (vars.command.stepId as String) ++ ':CHARGE']" doc:name="Set dedupKey" />
+
+				<flow-ref doc:name="Invoke Charge Sub-Flow" name="payment-charge-Sub_Flow" />
+
+				<ee:transform doc:name="Reply to JSON">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</otherwise>
+		</choice>
+
+		<!-- Publish Reply back to Saga Orchestrator -->
+		<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish payment.charge.reply">
+			<amqp:routing-keys>
+				<amqp:routing-key value="#[vars.request.replyTo default 'payment.charge.reply']" />
+			</amqp:routing-keys>
+			<amqp:message>
+				<amqp:body>#[payload]</amqp:body>
+				<amqp:properties correlationId="#[vars.request.correlationId default correlationId]" />
+			</amqp:message>
+		</amqp:publish>
+
+		<error-handler>
+			<on-error-continue type="ANY" logException="true">
+				<flow-ref name="payment-handle-duplicate-race-sub-flow" doc:name="Handle Payment Race or Format Error" />
+				<ee:transform doc:name="Format Error Payload">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+				<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish Error Reply">
+					<amqp:routing-keys>
+						<amqp:routing-key value="#[vars.request.replyTo default 'payment.charge.reply']" />
+					</amqp:routing-keys>
+					<amqp:message>
+						<amqp:body>#[payload]</amqp:body>
+						<amqp:properties correlationId="#[vars.request.correlationId default correlationId]" />
+					</amqp:message>
+				</amqp:publish>
+			</on-error-continue>
+		</error-handler>
+	</flow>
+
+	<!-- 2. AMQP Listener: Refund Payment Command (Saga Compensation Step 2) -->
+	<flow name="payment-refund-amqp-flow">
+		<amqp:listener doc:name="Listen payment.refund.command"
+			config-ref="RabbitMQ_Config"
+			queueName="payment.refund.command"
+			ackMode="AUTO"
+			outputMimeType="application/json">
+			<amqp:fallback-queue-definition removalStrategy="EXPLICIT" />
+		</amqp:listener>
+
+		<set-variable variableName="request" value="#[output application/java
+var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
+var body = raw.payload default raw
+---
+raw ++ {
+    correlationId: raw.correlationId default correlationId,
+    sagaId: raw.sagaId default 'SAGA-UNKNOWN',
+    stepId: raw.stepId default 'STEP-UNKNOWN',
+    replyTo: raw.replyTo default 'payment.refund.reply',
+    orderId: raw.orderId default body.orderId,
+    paymentId: raw.paymentId default body.paymentId
+}]" doc:name="Save refund request" />
+
+		<choice doc:name="Validate Refund Request">
+			<when expression="#[
+				isEmpty(vars.request.correlationId default '') or
+				isEmpty(vars.request.sagaId default '') or
+				isEmpty(vars.request.stepId default '') or
+				(isEmpty(vars.request.paymentId default '') and isEmpty(vars.request.orderId default ''))
+			]">
+				<set-payload value="#[output application/json ---
+{
+	correlationId: vars.request.correlationId default null,
+	sagaId: vars.request.sagaId default null,
+	stepId: vars.request.stepId default null,
+	stepName: 'REFUND_PAYMENT',
+	attempt: vars.request.attempt default 1,
+	outcome: 'FAILURE',
+	completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
+	failureType: 'BUSINESS',
+	failureCode: 'INVALID_REQUEST',
+	failureMessage: 'correlationId, sagaId, stepId and either paymentId or orderId are required',
+	retryable: false
+}]" doc:name="Invalid Request Payload" />
+			</when>
+			<otherwise>
+				<set-variable variableName="command" value="#[output application/java ---
+{
+	correlationId: vars.request.correlationId,
+	sagaId: vars.request.sagaId,
+	stepId: vars.request.stepId,
+	stepName: vars.request.stepName default 'REFUND_PAYMENT',
+	attempt: vars.request.attempt default 1,
+	payload: {
+		paymentId: vars.request.paymentId default null,
+		orderId: vars.request.orderId default null
+	}
+}]" doc:name="Build Refund Command" />
+
+				<set-variable variableName="dedupKey" value="#[(vars.command.sagaId as String) ++ ':' ++ (vars.command.stepId as String) ++ ':REFUND']" doc:name="Set dedupKey" />
+
+				<flow-ref doc:name="Invoke Refund Sub-Flow" name="payment-refund-Sub_Flow" />
+
+				<ee:transform doc:name="Reply to JSON">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</otherwise>
+		</choice>
+
+		<!-- Publish Refund Reply back to Saga Orchestrator -->
+		<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish payment.refund.reply">
+			<amqp:routing-keys>
+				<amqp:routing-key value="#[vars.request.replyTo default 'payment.refund.reply']" />
+			</amqp:routing-keys>
+			<amqp:message>
+				<amqp:body>#[payload]</amqp:body>
+				<amqp:properties correlationId="#[vars.request.correlationId default correlationId]" />
+			</amqp:message>
+		</amqp:publish>
+
+		<error-handler>
+			<on-error-continue type="ANY" logException="true">
+				<flow-ref name="payment-handle-duplicate-race-sub-flow" doc:name="Handle Payment Race or Format Error" />
+				<ee:transform doc:name="Format Error Payload">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+				<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish Error Reply">
+					<amqp:routing-keys>
+						<amqp:routing-key value="#[vars.request.replyTo default 'payment.refund.reply']" />
+					</amqp:routing-keys>
+					<amqp:message>
+						<amqp:body>#[payload]</amqp:body>
+						<amqp:properties correlationId="#[vars.request.correlationId default correlationId]" />
+					</amqp:message>
+				</amqp:publish>
 			</on-error-continue>
 		</error-handler>
 	</flow>
@@ -270,7 +520,7 @@ payload]]></ee:set-payload>
 				</when>
 				<otherwise>
 					<choice doc:name="Simulate Gateway Approval">
-						<when expression="#[vars.command.payload.cardToken == 'TKN-DECLINE']">
+						<when expression="#[vars.command.payload.cardToken == 'TKN-DECLINE' or ((vars.command.payload.cardToken default '') startsWith 'DECLINE')]">
 							<set-variable variableName="paymentReply" value="#[output application/java ---
 {
 	correlationId: vars.command.correlationId,
