@@ -1,0 +1,293 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+    <munit:config name="order-experience-api-test-suite.xml" />
+
+    <!-- 1. POST Order Fulfilment: Happy Path (200 OK) -->
+    <munit:test name="order-experience-post-order-success-test" description="Verifies successful order submission forwarding">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="method" whereValue="#['POST']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[output application/json --- { sagaId: 'SAGA-2026-TEST01', orderId: 'ORD-EXP-01', sagaState: 'COMPLETED' }]" mediaType="application/json" />
+                    <munit-tools:attributes value="#[{ statusCode: 200 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "orderId": "ORD-EXP-01", "customerId": "CUST-01", "totalAmount": 1500.00, "items": [{"sku": "SKU-TSHIRT-BLK-M", "quantity": 1, "unitPrice": 1500.00}], "payment": {"method": "CARD", "cardToken": "TKN-VALID"}, "shipping": {"addressLine1": "123 Main St", "city": "Chennai", "state": "TN", "postalCode": "600002", "country": "India"} }' mediaType="application/json" />
+                <munit:attributes value="#[{ headers: { 'x-correlation-id': 'test-corr-id-01' } }]" />
+            </munit:set-event>
+            <flow-ref name="post:\sagas\order-fulfilment:application\json:order-experience-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[200]" message="HTTP Status should be 200" />
+            <munit-tools:assert-that expression="#[payload.sagaState]" is="#[MunitTools::equalTo('COMPLETED')]" message="Saga state should be COMPLETED" />
+            <munit-tools:assert-that expression="#[vars.corrId]" is="#[MunitTools::notNullValue()]" message="Correlation ID must be propagated" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 2. POST Order Fulfilment: Asynchronous Initiation (202 Accepted) -->
+    <munit:test name="order-experience-post-order-async-202-test" description="Verifies asynchronous 202 Accepted forwarding">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="method" whereValue="#['POST']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[output application/json --- { sagaId: 'SAGA-2026-TEST02', orderId: 'ORD-EXP-02', sagaState: 'STARTED', statusUrl: '/api/v1/sagas/SAGA-2026-TEST02' }]" mediaType="application/json" />
+                    <munit-tools:attributes value="#[{ statusCode: 202 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "orderId": "ORD-EXP-02", "customerId": "CUST-02", "totalAmount": 1000.00, "items": [{"sku": "SKU-TSHIRT-BLK-M", "quantity": 1, "unitPrice": 1000.00}], "payment": {"method": "CARD", "cardToken": "TKN-VALID"}, "shipping": {"addressLine1": "456 Market St", "city": "Chennai", "state": "TN", "postalCode": "600002", "country": "India"} }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\sagas\order-fulfilment:application\json:order-experience-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[202]" message="HTTP Status should be 202" />
+            <munit-tools:assert-that expression="#[payload.statusUrl]" is="#[MunitTools::notNullValue()]" message="Status URL must be present" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 3. POST Order Fulfilment: Downstream Connectivity Failure (502 Bad Gateway) -->
+    <munit:test name="order-experience-post-order-connectivity-502-test" description="Verifies 502 Bad Gateway when Process API is offline">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="method" whereValue="#['POST']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="HTTP:CONNECTIVITY" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "orderId": "ORD-EXP-FAIL", "customerId": "CUST-01", "totalAmount": 500.00, "items": [{"sku": "SKU-TSHIRT-BLK-M", "quantity": 1, "unitPrice": 500.00}], "payment": {"method": "CARD", "cardToken": "TKN-VALID"}, "shipping": {"addressLine1": "Street 1", "city": "Chennai", "state": "TN", "postalCode": "600002", "country": "India"} }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\sagas\order-fulfilment:application\json:order-experience-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 500]" expected="#[502]" message="HTTP Status should be 502 Bad Gateway" />
+            <munit-tools:assert-equals actual="#[payload.errorCode]" expected="#['BAD_GATEWAY']" message="Error code should be BAD_GATEWAY" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 4. POST Order Fulfilment: Gateway Timeout (504 Gateway Timeout) -->
+    <munit:test name="order-experience-post-order-timeout-504-test" description="Verifies 504 Gateway Timeout when Process API times out">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="method" whereValue="#['POST']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="HTTP:TIMEOUT" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "orderId": "ORD-EXP-TIMEOUT", "customerId": "CUST-01", "totalAmount": 500.00, "items": [{"sku": "SKU-TSHIRT-BLK-M", "quantity": 1, "unitPrice": 500.00}], "payment": {"method": "CARD", "cardToken": "TKN-VALID"}, "shipping": {"addressLine1": "Street 1", "city": "Chennai", "state": "TN", "postalCode": "600002", "country": "India"} }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\sagas\order-fulfilment:application\json:order-experience-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 500]" expected="#[504]" message="HTTP Status should be 504 Gateway Timeout" />
+            <munit-tools:assert-equals actual="#[payload.errorCode]" expected="#['GATEWAY_TIMEOUT']" message="Error code should be GATEWAY_TIMEOUT" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 5. GET Saga Status: Found (200 OK) -->
+    <munit:test name="order-experience-get-status-success-test" description="Verifies retrieving saga status successfully">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="method" whereValue="#['GET']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[output application/json --- { sagaId: 'SAGA-2026-TEST01', orderId: 'ORD-EXP-01', sagaState: 'COMPLETED', steps: [] }]" mediaType="application/json" />
+                    <munit-tools:attributes value="#[{ statusCode: 200 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:attributes value="#[{ uriParams: { sagaId: 'SAGA-2026-TEST01' }, headers: { 'x-correlation-id': 'status-corr-id' } }]" />
+            </munit:set-event>
+            <flow-ref name="get:\sagas\(sagaId):order-experience-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[200]" message="HTTP Status should be 200" />
+            <munit-tools:assert-equals actual="#[payload.sagaId]" expected="#['SAGA-2026-TEST01']" message="Saga ID should match" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 6. GET Saga Status: Not Found (404) -->
+    <munit:test name="order-experience-get-status-not-found-test" description="Verifies 404 response preserved when saga is not found">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="method" whereValue="#['GET']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[output application/json --- { errorCode: 'SAGA_NOT_FOUND', message: 'Saga not found' }]" mediaType="application/json" />
+                    <munit-tools:attributes value="#[{ statusCode: 404 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:attributes value="#[{ uriParams: { sagaId: 'SAGA-INVALID' } }]" />
+            </munit:set-event>
+            <flow-ref name="get:\sagas\(sagaId):order-experience-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[404]" message="HTTP Status should be 404" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 7. POST Order Fulfilment: Unexpected Error (500 Internal Error) -->
+    <munit:test name="order-experience-post-order-any-500-test" description="Verifies 500 Internal Error when unexpected error occurs">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="method" whereValue="#['POST']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="MULE:UNKNOWN" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "orderId": "ORD-EXP-ERR", "customerId": "CUST-01", "totalAmount": 500.00, "items": [{"sku": "SKU-TSHIRT-BLK-M", "quantity": 1, "unitPrice": 500.00}], "payment": {"method": "CARD", "cardToken": "TKN-VALID"}, "shipping": {"addressLine1": "Street 1", "city": "Chennai", "state": "TN", "postalCode": "600002", "country": "India"} }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\sagas\order-fulfilment:application\json:order-experience-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[500]" message="HTTP Status should be 500" />
+            <munit-tools:assert-equals actual="#[payload.errorCode]" expected="#['INTERNAL_ERROR']" message="Error code should be INTERNAL_ERROR" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 8. GET Saga Status: Connectivity Error (502 Bad Gateway) -->
+    <munit:test name="order-experience-get-status-connectivity-502-test" description="Verifies 502 Bad Gateway when Process API connection fails on status query">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="method" whereValue="#['GET']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="HTTP:CONNECTIVITY" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:attributes value="#[{ uriParams: { sagaId: 'SAGA-CONN-ERR' } }]" />
+            </munit:set-event>
+            <flow-ref name="get:\sagas\(sagaId):order-experience-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[502]" message="HTTP Status should be 502" />
+            <munit-tools:assert-equals actual="#[payload.errorCode]" expected="#['BAD_GATEWAY']" message="Error code should be BAD_GATEWAY" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 9. GET Saga Status: Timeout (504 Gateway Timeout) -->
+    <munit:test name="order-experience-get-status-timeout-504-test" description="Verifies 504 Gateway Timeout when Process API times out on status query">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="method" whereValue="#['GET']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="HTTP:TIMEOUT" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:attributes value="#[{ uriParams: { sagaId: 'SAGA-TIMEOUT' } }]" />
+            </munit:set-event>
+            <flow-ref name="get:\sagas\(sagaId):order-experience-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[504]" message="HTTP Status should be 504" />
+            <munit-tools:assert-equals actual="#[payload.errorCode]" expected="#['GATEWAY_TIMEOUT']" message="Error code should be GATEWAY_TIMEOUT" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 10. GET Saga Status: Unexpected Error (500 Internal Error) -->
+    <munit:test name="order-experience-get-status-any-500-test" description="Verifies 500 Internal Error on unexpected status query failure">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="method" whereValue="#['GET']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="MULE:UNKNOWN" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:attributes value="#[{ uriParams: { sagaId: 'SAGA-UNEXPECTED' } }]" />
+            </munit:set-event>
+            <flow-ref name="get:\sagas\(sagaId):order-experience-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[500]" message="HTTP Status should be 500" />
+            <munit-tools:assert-equals actual="#[payload.errorCode]" expected="#['INTERNAL_ERROR']" message="Error code should be INTERNAL_ERROR" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 11. Experience API Router Main Flow -->
+    <munit:test name="order-experience-main-flow-test" description="Verifies order experience main APIKit router execution">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:router">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[output application/json --- { status: 'OK' }]" mediaType="application/json" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="order-experience-api-main" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="apikit:router" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 12. Experience API Console Flow -->
+    <munit:test name="order-experience-console-flow-test" description="Verifies order experience console execution">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:console">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#['Console UI']" mediaType="text/plain" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="order-experience-api-console" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="apikit:console" times="1" />
+        </munit:validation>
+    </munit:test>
+
+</mule>

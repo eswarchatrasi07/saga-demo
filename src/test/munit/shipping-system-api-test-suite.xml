@@ -1,0 +1,824 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+    <munit:config name="shipping-system-api-test-suite.xml" />
+
+    <!-- 1. Shipping Dispatch: Happy Path (SUCCESS) -->
+    <munit:test name="shipping-dispatch-success-test" description="Verifies parcel dispatch and tracking number generation">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingDispatch" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-03", stepName: "DISPATCH_SHIPPING", commandType: "DISPATCH", attempt: 1, payload: { orderId: "ORD-01", shippingAddress: { addressLine1: "21 Anna Salai", city: "Chennai", state: "TN", postalCode: "600002", country: "India" }, serviceLevel: "STANDARD" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-03:DISPATCH']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="shipping-dispatch-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.shippingReply.outcome]" expected="#['SUCCESS']" message="Dispatch outcome should be SUCCESS" />
+            <munit-tools:assert-that expression="#[vars.shippingReply.result.trackingNumber]" is="#[MunitTools::notNullValue()]" message="Tracking number must be generated" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 2. Shipping Dispatch: Rejection (Invalid Postal Code 000000) -->
+    <munit:test name="shipping-dispatch-rejected-test" description="Verifies unserviceable location produces business failure">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingDispatch" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01-REJ", stepId: "S-03-REJ", stepName: "DISPATCH_SHIPPING", commandType: "DISPATCH", attempt: 1, payload: { orderId: "ORD-01", postalCode: "000000", serviceLevel: "FAIL_DISPATCH", addressLine1: "REJECT Bad Address", city: "Nowhere", state: "NA", country: "India" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01-REJ:S-03-REJ:DISPATCH']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="shipping-dispatch-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.shippingReply.outcome]" expected="#['FAILURE']" message="Outcome should be FAILURE" />
+            <munit-tools:assert-equals actual="#[vars.shippingReply.retryable]" expected="#[false]" message="Address error should not be retryable" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 3. Shipping Dispatch: Idempotent Replay -->
+    <munit:test name="shipping-dispatch-idempotent-replay-test" description="Verifies cached response returned on duplicate dispatch command">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingDispatch" value="#[[{ dedup_key: 'SAGA-01:S-03:DISPATCH', result_payload: '{ &quot;outcome&quot;: &quot;SUCCESS&quot;, &quot;trackingNumber&quot;: &quot;TRK-CACHED-77&quot; }' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-03", stepName: "DISPATCH_SHIPPING", commandType: "DISPATCH", attempt: 1, payload: { orderId: "ORD-01", shippingAddress: { addressLine1: "21 Anna Salai", postalCode: "600002" } } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-03:DISPATCH']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="shipping-dispatch-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.shippingReply.trackingNumber]" expected="#['TRK-CACHED-77']" message="Replayed trackingNumber should match cached record" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 4. Shipping Cancellation: Happy Path (SUCCESS) -->
+    <munit:test name="shipping-cancel-compensation-test" description="Verifies shipping cancellation compensation marks status CANCELLED">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingCancel" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="shippingRows" value="#[[{ shipping_id: 'SHP-01', order_id: 'ORD-01', tracking_number: 'TRK-01', status: 'DISPATCHED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-03", stepName: "CANCEL_SHIPPING", commandType: "CANCEL", attempt: 1, payload: { orderId: "ORD-01" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-03:CANCEL']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="shipping-cancel-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.cancelReply.outcome]" expected="#['SUCCESS']" message="Cancel outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 5. Shipping Cancellation: Already Cancelled Branch -->
+    <munit:test name="shipping-cancel-already-cancelled-test" description="Verifies already CANCELLED status produces idempotent success">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingCancel" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="shippingRows" value="#[[{ shipping_id: 'SHP-01', order_id: 'ORD-01', tracking_number: 'TRK-01', status: 'CANCELLED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-03", stepName: "CANCEL_SHIPPING", commandType: "CANCEL", attempt: 1, payload: { orderId: "ORD-01" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-03:CANCEL']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="shipping-cancel-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.cancelReply.outcome]" expected="#['SUCCESS']" message="Cancel outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 6. POST /shipping/dispatch: HTTP Endpoint Happy Path (200 OK) -->
+    <munit:test name="shipping-post-dispatch-http-success-test" description="Verifies POST /shipping/dispatch HTTP router and response">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingDispatch" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-03", "orderId": "ORD-01", "shippingAddress": { "addressLine1": "21 Anna Salai", "city": "Chennai", "state": "TN", "postalCode": "600002", "country": "India" }, "serviceLevel": "STANDARD" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\shipping\dispatch:application\json:shipping-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[200]" message="HTTP Status should be 200" />
+            <munit-tools:assert-equals actual="#[payload.outcome]" expected="#['SUCCESS']" message="Outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 7. POST /shipping/dispatch: HTTP Validation Error (400) -->
+    <munit:test name="shipping-post-dispatch-validation-error-test" description="Verifies 400 Bad Request on missing shipping address">
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-VAL-ERR", "stepId": "S-VAL-ERR", "orderId": "ORD-01" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\shipping\dispatch:application\json:shipping-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 500]" expected="#[400]" message="Status should be 400" />
+            <munit-tools:assert-equals actual="#[payload.failureCode]" expected="#['INVALID_REQUEST']" message="Failure code should be INVALID_REQUEST" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 8. POST /shipping/cancel: HTTP Endpoint Happy Path (200 OK) -->
+    <munit:test name="shipping-post-cancel-http-success-test" description="Verifies POST /shipping/cancel HTTP router and response">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingCancel" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="shippingRows" value="#[[{ shipping_id: 'SHP-01', order_id: 'ORD-01', tracking_number: 'TRK-01', status: 'DISPATCHED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-03", "orderId": "ORD-01" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\shipping\cancel:application\json:shipping-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[200]" message="HTTP Status should be 200" />
+            <munit-tools:assert-equals actual="#[payload.outcome]" expected="#['SUCCESS']" message="Outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 9. POST /shipping/cancel: HTTP Validation Error (400) -->
+    <munit:test name="shipping-post-cancel-validation-error-test" description="Verifies 400 Bad Request on missing orderId and shippingId">
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-03" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\shipping\cancel:application\json:shipping-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 500]" expected="#[400]" message="Status should be 400" />
+            <munit-tools:assert-equals actual="#[payload.failureCode]" expected="#['INVALID_REQUEST']" message="Failure code should be INVALID_REQUEST" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 10. AMQP Dispatch Flow: Success -->
+    <munit:test name="shipping-dispatch-amqp-success-test" description="Verifies shipping dispatch AMQP command listener">
+        <munit:behavior>
+            <munit-tools:mock-when processor="amqp:publish" />
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingDispatch" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-03", "replyTo": "shipping.dispatch.reply", "payload": { "orderId": "ORD-01", "shippingAddress": { "addressLine1": "21 Anna Salai", "city": "Chennai", "state": "TN", "postalCode": "600002", "country": "India" }, "serviceLevel": "STANDARD" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="shipping-dispatch-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.shippingReply.outcome]" expected="#['SUCCESS']" message="AMQP dispatch outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 11. AMQP Cancel Flow: Success -->
+    <munit:test name="shipping-cancel-amqp-success-test" description="Verifies shipping cancel AMQP compensation listener">
+        <munit:behavior>
+            <munit-tools:mock-when processor="amqp:publish" />
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingCancel" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="shippingRows" value="#[[{ shipping_id: 'SHP-01', order_id: 'ORD-01', tracking_number: 'TRK-01', status: 'DISPATCHED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-03", "replyTo": "shipping.cancel.reply", "payload": { "orderId": "ORD-01" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="shipping-cancel-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.cancelReply.outcome]" expected="#['SUCCESS']" message="AMQP cancel outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 12. Main Router Flow -->
+    <munit:test name="shipping-system-main-flow-test" description="Verifies shipping system main APIKit router execution">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:router">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[output application/json --- { status: 'OK' }]" mediaType="application/json" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="shipping-system-api-main" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="apikit:router" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 13. Duplicate Race Subflow: Winner Available -->
+    <munit:test name="shipping-duplicate-race-winner-available-test" description="Verifies duplicate race handles existing winner response">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Read winner response']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="raceCheckResult" value="#[[{ result_payload: '{ &quot;outcome&quot;: &quot;SUCCESS&quot;, &quot;shippingId&quot;: &quot;SHIP-RACE-01&quot; }' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="dedupKey" value="#['DEDUP-SHIP-RACE-01']" />
+                </munit:variables>
+            </munit:set-event>
+            <try>
+                <raise-error type="APP:DUPLICATE" description="Duplicate entry 'DEDUP-SHIP-RACE-01' for key PRIMARY" />
+                <error-handler>
+                    <on-error-continue>
+                        <flow-ref name="shipping-handle-duplicate-race-sub-flow" />
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[200]" message="Status should be 200" />
+            <munit-tools:assert-equals actual="#[payload.outcome]" expected="#['SUCCESS']" message="Outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 14. Duplicate Race Subflow: Winner In Progress (409) -->
+    <munit:test name="shipping-duplicate-race-winner-empty-test" description="Verifies duplicate race handles conflict when winner not yet written">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Read winner response']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="raceCheckResult" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="dedupKey" value="#['DEDUP-SHIP-RACE-02']" />
+                    <munit:variable key="command" value="#[{ stepId: 'STEP-SHIP-RACE-02' }]" />
+                </munit:variables>
+            </munit:set-event>
+            <try>
+                <raise-error type="APP:DUPLICATE" description="Duplicate entry for dedup_key" />
+                <error-handler>
+                    <on-error-continue>
+                        <flow-ref name="shipping-handle-duplicate-race-sub-flow" />
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 500]" expected="#[409]" message="Status should be 409" />
+            <munit-tools:assert-equals actual="#[payload.failureCode]" expected="#['COMMAND_IN_PROGRESS']" message="Failure code should be COMMAND_IN_PROGRESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 15. Duplicate Race Subflow: Non-Duplicate Fallback -->
+    <munit:test name="shipping-duplicate-race-non-duplicate-test" description="Verifies duplicate race delegates other errors to global handler">
+        <munit:behavior>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['global-prepare-error-response-sub-flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return />
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <try>
+                <raise-error type="APP:DB_ERROR" description="Database connection dropped" />
+                <error-handler>
+                    <on-error-continue>
+                        <flow-ref name="shipping-handle-duplicate-race-sub-flow" />
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="flow-ref" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['global-prepare-error-response-sub-flow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 16. Cancel Subflow: Already Cancelled Direct -->
+    <munit:test name="shipping-cancel-already-cancelled-direct-test" description="Verifies cancel subflow when shipment is already cancelled">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingCancel" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="shippingRows" value="#[[{ shipping_id: 'SHIP-ALREADY', order_id: 'ORD-01', tracking_number: 'TRK-01', status: 'CANCELLED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "S-01", "stepId": "STEP-03", "payload": { "orderId": "ORD-01" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="shipping-cancel-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.cancelReply.outcome]" expected="#['SUCCESS']" message="Outcome should be SUCCESS" />
+            <munit-tools:assert-equals actual="#[vars.cancelReply.result.status]" expected="#['CANCELLED']" message="Status should be CANCELLED" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 17. Cancel Subflow: Shipping Not Found -->
+    <munit:test name="shipping-cancel-not-found-test" description="Verifies SHIPPING:SHIPPING_NOT_FOUND when shipping row does not exist" expectedErrorType="SHIPPING:SHIPPING_NOT_FOUND">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingCancel" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="shippingRows" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "S-01", "stepId": "STEP-03", "payload": { "orderId": "ORD-NONEXISTENT" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="shipping-cancel-Sub_Flow" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 18. AMQP Dispatch Flow: Error Handler -->
+    <munit:test name="shipping-dispatch-amqp-error-test" description="Verifies AMQP dispatch flow error handler publishes error reply">
+        <munit:behavior>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['shipping-dispatch-Sub_Flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="MULE:UNKNOWN" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['global-prepare-error-response-sub-flow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-ERR", "stepId": "S-03", "replyTo": "shipping.dispatch.reply", "payload": { "orderId": "ORD-01", "shippingAddress": { "addressLine1": "123 Main St", "city": "Dallas", "postalCode": "75001", "country": "USA" } } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="shipping-dispatch-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 19. AMQP Cancel Flow: Error Handler -->
+    <munit:test name="shipping-cancel-amqp-error-test" description="Verifies AMQP cancel flow error handler publishes error reply">
+        <munit:behavior>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['shipping-cancel-Sub_Flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="MULE:UNKNOWN" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['global-prepare-error-response-sub-flow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-ERR", "stepId": "S-03", "replyTo": "shipping.cancel.reply", "payload": { "orderId": "ORD-01" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="shipping-cancel-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 20. AMQP Cancel Flow: Validation Failure (Missing Identifiers) -->
+    <munit:test name="shipping-cancel-amqp-validation-failure-test" description="Verifies AMQP cancel flow validation failure publishes error reply">
+        <munit:behavior>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-03", "replyTo": "shipping.cancel.reply", "payload": { "orderId": "", "shippingId": "" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="shipping-cancel-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[payload.outcome]" expected="#['FAILURE']" message="Outcome should be FAILURE" />
+            <munit-tools:assert-equals actual="#[payload.failureCode]" expected="#['INVALID_REQUEST']" message="Failure code should be INVALID_REQUEST" />
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 21. POST /shipping/dispatch HTTP Flow: Error Handler -->
+    <munit:test name="shipping-post-dispatch-flow-error-handler-test" description="Verifies POST /shipping/dispatch catches subflow error and executes flow error handler">
+        <munit:behavior>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['shipping-dispatch-Sub_Flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="MULE:UNKNOWN" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['global-prepare-error-response-sub-flow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-03", "orderId": "ORD-01", "shippingAddress": { "addressLine1": "123 Main St", "city": "Dallas", "postalCode": "75001", "country": "USA" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\shipping\dispatch:application\json:shipping-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Handle Shipping Duplicate Race or Delegate']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 22. POST /shipping/cancel HTTP Flow: Error Handler -->
+    <munit:test name="shipping-post-cancel-flow-error-handler-test" description="Verifies POST /shipping/cancel catches subflow error and executes flow error handler">
+        <munit:behavior>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['shipping-cancel-Sub_Flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="MULE:UNKNOWN" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['global-prepare-error-response-sub-flow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-03", "orderId": "ORD-01" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\shipping\cancel:application\json:shipping-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Handle Shipping Duplicate Race or Delegate']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 23. Shipping Cancel Subflow: Cancel by Shipping ID -->
+    <munit:test name="shipping-cancel-by-shipping-id-subflow-test" description="Verifies cancel subflow looks up by shipping ID when orderId is omitted">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingCancel" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by ShippingId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="shippingRows" value="#[[{ shipping_id: 'SHIP-01', order_id: 'ORD-01', tracking_number: 'TRK-01', service_level: 'STANDARD', status: 'DISPATCHED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-03", stepName: "CANCEL_SHIPPING", commandType: "CANCEL", attempt: 1, payload: { shippingId: "SHIP-01" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-03:CANCEL']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="shipping-cancel-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.cancelReply.outcome]" expected="#['SUCCESS']" message="Cancel outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 24. Shipping Cancel Subflow: Replay Cached Response -->
+    <munit:test name="shipping-cancel-replay-cached-subflow-test" description="Verifies cancel subflow replays cached response when dedupKey already processed">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingCancel" value="#[[{ dedup_key: 'SAGA-01:S-03:CANCEL', result_payload: '{&quot;outcome&quot;:&quot;SUCCESS&quot;,&quot;stepName&quot;:&quot;CANCEL_SHIPPING&quot;}' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-03", stepName: "CANCEL_SHIPPING", commandType: "CANCEL", attempt: 1, payload: { orderId: "ORD-01" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-03:CANCEL']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="shipping-cancel-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.cancelReply.outcome]" expected="#['SUCCESS']" message="Replayed cancel outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 25. Shipping Cancel Subflow: Invalid Shipping State -->
+    <munit:test name="shipping-cancel-invalid-state-subflow-test" description="Verifies cancel subflow raises SHIPPING:INVALID_SHIPPING_STATE when state is invalid" expectedErrorType="SHIPPING:INVALID_SHIPPING_STATE">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingCancel" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="shippingRows" value="#[[{ shipping_id: 'SHIP-01', order_id: 'ORD-01', status: 'PENDING' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-03", stepName: "CANCEL_SHIPPING", commandType: "CANCEL", attempt: 1, payload: { orderId: "ORD-01" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-03:CANCEL']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="shipping-cancel-Sub_Flow" />
+        </munit:execution>
+    </munit:test>
+
+</mule>

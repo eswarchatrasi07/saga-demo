@@ -1,0 +1,1216 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+    <munit:config name="inventory-system-api-test-suite.xml" />
+
+    <!-- 1. GET /stock/{sku}: SKU Found (200 OK) -->
+    <munit:test name="inventory-get-stock-found-test" description="Verifies stock query when SKU exists">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Read stock by SKU']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockRows" value="#[[{ sku: 'SKU-TSHIRT-BLK-M', available_quantity: 50, reserved_quantity: 5 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:attributes value="#[{ uriParams: { sku: 'SKU-TSHIRT-BLK-M' } }]" />
+            </munit:set-event>
+            <flow-ref name="get:\stock\(sku):inventory-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[200]" message="Status should be 200" />
+            <munit-tools:assert-equals actual="#[payload.sku]" expected="#['SKU-TSHIRT-BLK-M']" message="SKU should match" />
+            <munit-tools:assert-equals actual="#[payload.available_quantity]" expected="#[50]" message="Available quantity should be 50" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 2. GET /stock/{sku}: SKU Not Found (404) -->
+    <munit:test name="inventory-get-stock-not-found-test" description="Verifies 404 when SKU does not exist">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Read stock by SKU']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockRows" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:attributes value="#[{ uriParams: { sku: 'NON-EXISTENT-SKU' } }]" />
+            </munit:set-event>
+            <flow-ref name="get:\stock\(sku):inventory-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 404]" expected="#[404]" message="Status should be 404" />
+            <munit-tools:assert-equals actual="#[payload.errorCode]" expected="#['SKU_NOT_FOUND']" message="Error code should be SKU_NOT_FOUND" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 3. Reserve Inventory: Sub-Flow Happy Path (200 OK) -->
+    <munit:test name="inventory-reserve-success-test" description="Verifies inventory reservation happy path in sub-flow">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReserveCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock product stock row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockRows" value="#[[{ sku: 'SKU-TSHIRT-BLK-M', available_quantity: 20 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockUpdateResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-01", stepName: "RESERVE_INVENTORY", commandType: "RESERVE", attempt: 1, payload: { orderId: "ORD-01", items: [{ sku: "SKU-TSHIRT-BLK-M", quantity: 2 }] } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-01:RESERVE']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-reserver-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.inventoryReply.outcome]" expected="#['SUCCESS']" message="Outcome should be SUCCESS" />
+            <munit-tools:assert-that expression="#[vars.inventoryReply.result.reservationId]" is="#[MunitTools::notNullValue()]" message="Reservation ID must be returned" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 4. Reserve Inventory: Idempotency Hit (Replays Saved Response) -->
+    <munit:test name="inventory-reserve-idempotent-replay-test" description="Verifies cached response returned on duplicate command delivery">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReserveCommand" value="#[[{ dedup_key: 'SAGA-01:S-01:RESERVE', result_payload: '{ &quot;outcome&quot;: &quot;SUCCESS&quot;, &quot;reservationId&quot;: &quot;RES-CACHED-01&quot; }' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-01", stepName: "RESERVE_INVENTORY", commandType: "RESERVE", attempt: 1, payload: { orderId: "ORD-01", items: [{ sku: "SKU-TSHIRT-BLK-M", quantity: 2 }] } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-01:RESERVE']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-reserver-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.inventoryReply.outcome]" expected="#['SUCCESS']" message="Replayed outcome should be SUCCESS" />
+            <munit-tools:assert-equals actual="#[vars.inventoryReply.reservationId]" expected="#['RES-CACHED-01']" message="Replayed reservationId should match cached record" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 5. Reserve Inventory: Insufficient Stock Branch -->
+    <munit:test name="inventory-reserve-insufficient-stock-test" description="Verifies insufficient stock business failure handling">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReserveCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock product stock row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockRows" value="#[[{ sku: 'SKU-TSHIRT-BLK-M', available_quantity: 1 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01-FAIL", stepId: "S-01-FAIL", stepName: "RESERVE_INVENTORY", commandType: "RESERVE", attempt: 1, payload: { orderId: "ORD-01", items: [{ sku: "SKU-TSHIRT-BLK-M", quantity: 50 }] } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01-FAIL:S-01-FAIL:RESERVE']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-reserver-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.inventoryReply.outcome]" expected="#['FAILURE']" message="Outcome should be FAILURE" />
+            <munit-tools:assert-equals actual="#[vars.inventoryReply.failureCode]" expected="#['INSUFFICIENT_QUANTITY']" message="Failure code should be INSUFFICIENT_QUANTITY" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 6. Reserve Inventory: Unknown SKU Branch -->
+    <munit:test name="inventory-reserve-unknown-sku-test" description="Verifies unknown SKU business failure handling">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReserveCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock product stock row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockRows" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01-SKU", stepId: "S-01-SKU", stepName: "RESERVE_INVENTORY", commandType: "RESERVE", attempt: 1, payload: { orderId: "ORD-01", items: [{ sku: "SKU-UNKNOWN", quantity: 2 }] } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01-SKU:S-01-SKU:RESERVE']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-reserver-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.inventoryReply.outcome]" expected="#['FAILURE']" message="Outcome should be FAILURE" />
+            <munit-tools:assert-equals actual="#[vars.inventoryReply.failureCode]" expected="#['UNKNOWN_SKU']" message="Failure code should be UNKNOWN_SKU" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 7. POST /reserve: HTTP Endpoint Happy Path (200 OK) -->
+    <munit:test name="inventory-post-reserve-http-success-test" description="Verifies POST /reserve HTTP router and response code">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReserveCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock product stock row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockRows" value="#[[{ sku: 'SKU-TSHIRT-BLK-M', available_quantity: 20 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockUpdateResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-01", "orderId": "ORD-01", "items": [{"sku": "SKU-TSHIRT-BLK-M", "quantity": 2}] }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\reserve:application\json:inventory-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[200]" message="HTTP Status should be 200" />
+            <munit-tools:assert-equals actual="#[payload.outcome]" expected="#['SUCCESS']" message="Outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 8. POST /reserve: HTTP Validation Error (400) -->
+    <munit:test name="inventory-post-reserve-validation-error-test" description="Verifies 400 Bad Request on invalid quantity">
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-01", "orderId": "ORD-01", "items": [{"sku": "SKU-TSHIRT-BLK-M", "quantity": -1}] }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\reserve:application\json:inventory-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 500]" expected="#[400]" message="Status should be 400" />
+            <munit-tools:assert-equals actual="#[payload.errorCode]" expected="#['INVALID_ITEM']" message="Error code should be INVALID_ITEM" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 9. POST /release: HTTP Endpoint Happy Path (200 OK) -->
+    <munit:test name="inventory-post-release-http-success-test" description="Verifies POST /release HTTP router and response code">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReleaseCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock reservation row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="reservationRows" value="#[[{ reservation_id: 'RES-01', order_id: 'ORD-01', sku: 'SKU-TSHIRT-BLK-M', quantity: 2, status: 'RESERVED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockRestoreResult" value="#[{ affectedRows: 1 }]" />
+                        <munit-tools:variable key="reservationUpdateResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-01", "orderId": "ORD-01", "reservationId": "RES-01" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\release:application\json:inventory-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[200]" message="HTTP Status should be 200" />
+            <munit-tools:assert-equals actual="#[payload.outcome]" expected="#['SUCCESS']" message="Outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 10. POST /release: HTTP Validation Error (400) -->
+    <munit:test name="inventory-post-release-validation-error-test" description="Verifies 400 Bad Request on missing identifiers">
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-01" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\release:application\json:inventory-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 500]" expected="#[400]" message="Status should be 400" />
+            <munit-tools:assert-equals actual="#[payload.failureCode]" expected="#['INVALID_REQUEST']" message="Error code should be INVALID_REQUEST" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 11. AMQP Reserve Flow: Success -->
+    <munit:test name="inventory-reserve-amqp-success-test" description="Verifies inventory reserve AMQP command listener">
+        <munit:behavior>
+            <munit-tools:mock-when processor="amqp:publish" />
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReserveCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock product stock row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockRows" value="#[[{ sku: 'SKU-TSHIRT-BLK-M', available_quantity: 20 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockUpdateResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-01", "replyTo": "inventory.reserve.reply", "payload": { "orderId": "ORD-01", "items": [{ "sku": "SKU-TSHIRT-BLK-M", "quantity": 2 }] } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="inventory-reserve-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.inventoryReply.outcome]" expected="#['SUCCESS']" message="AMQP response outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 12. AMQP Release Flow: Success -->
+    <munit:test name="inventory-release-amqp-success-test" description="Verifies inventory release AMQP compensation listener">
+        <munit:behavior>
+            <munit-tools:mock-when processor="amqp:publish" />
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReleaseCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock reservation row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="reservationRows" value="#[[{ reservation_id: 'RES-01', order_id: 'ORD-01', sku: 'SKU-TSHIRT-BLK-M', quantity: 2, status: 'RESERVED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockRestoreResult" value="#[{ affectedRows: 1 }]" />
+                        <munit-tools:variable key="reservationUpdateResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-01", "replyTo": "inventory.release.reply", "payload": { "orderId": "ORD-01", "reservationId": "RES-01" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="inventory-release-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.inventoryReply.outcome]" expected="#['SUCCESS']" message="AMQP release outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 13. Release: Already Released Idempotency Branch -->
+    <munit:test name="inventory-release-already-released-test" description="Verifies already RELEASED status skips restoration cleanly">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReleaseCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock reservation row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="reservationRows" value="#[[{ reservation_id: 'RES-01', order_id: 'ORD-01', sku: 'SKU-TSHIRT-BLK-M', quantity: 2, status: 'RELEASED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-01", stepName: "RELEASE_INVENTORY", commandType: "RELEASE", attempt: 1, payload: { orderId: "ORD-01", reservationIds: ["RES-01"] } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-01:RELEASE']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-release-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.inventoryReply.outcome]" expected="#['SUCCESS']" message="Release outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 14. Release: Reservation Not Found Branch -->
+    <munit:test name="inventory-release-not-found-test" description="Verifies 404 when reservation is not found" expectedErrorType="INVENTORY:RESERVATION_NOT_FOUND">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReleaseCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Find reservations by order']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="orderReservations" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-01", stepName: "RELEASE_INVENTORY", commandType: "RELEASE", attempt: 1, payload: { orderId: "ORD-NOT-FOUND" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-01:RELEASE']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-release-Sub_Flow" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 15. Console Flow -->
+    <munit:test name="inventory-system-console-flow-test" description="Verifies inventory system APIKit console execution">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:console">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#['Console UI']" mediaType="text/plain" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="inventory-system-api-console" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="apikit:console" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 16. Duplicate Race Subflow: Winner Available -->
+    <munit:test name="inventory-duplicate-race-winner-available-test" description="Verifies duplicate race handles existing winner response">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Read winner response']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="raceCheckResult" value="#[[{ result_payload: '{ &quot;outcome&quot;: &quot;SUCCESS&quot;, &quot;reservationId&quot;: &quot;RES-RACE-01&quot; }' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="dedupKey" value="#['DEDUP-INV-RACE-01']" />
+                </munit:variables>
+            </munit:set-event>
+            <try>
+                <raise-error type="APP:DUPLICATE" description="Duplicate entry 'DEDUP-INV-RACE-01' for key PRIMARY" />
+                <error-handler>
+                    <on-error-continue>
+                        <flow-ref name="inventory-handle-duplicate-race-sub-flow" />
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[200]" message="Status should be 200" />
+            <munit-tools:assert-equals actual="#[payload.outcome]" expected="#['SUCCESS']" message="Outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 17. Duplicate Race Subflow: Winner In Progress (409) -->
+    <munit:test name="inventory-duplicate-race-winner-empty-test" description="Verifies duplicate race handles conflict when winner not yet written">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Read winner response']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="raceCheckResult" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="dedupKey" value="#['DEDUP-INV-RACE-02']" />
+                    <munit:variable key="command" value="#[{ stepId: 'STEP-INV-RACE-02' }]" />
+                </munit:variables>
+            </munit:set-event>
+            <try>
+                <raise-error type="APP:DUPLICATE" description="Duplicate entry for dedup_key" />
+                <error-handler>
+                    <on-error-continue>
+                        <flow-ref name="inventory-handle-duplicate-race-sub-flow" />
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 500]" expected="#[409]" message="Status should be 409" />
+            <munit-tools:assert-equals actual="#[payload.failureCode]" expected="#['COMMAND_IN_PROGRESS']" message="Failure code should be COMMAND_IN_PROGRESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 18. Duplicate Race Subflow: Non-Duplicate Fallback -->
+    <munit:test name="inventory-duplicate-race-non-duplicate-test" description="Verifies duplicate race delegates other errors to global handler">
+        <munit:behavior>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['global-prepare-error-response-sub-flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return />
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <try>
+                <raise-error type="APP:DB_ERROR" description="Database connection dropped" />
+                <error-handler>
+                    <on-error-continue>
+                        <flow-ref name="inventory-handle-duplicate-race-sub-flow" />
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="flow-ref" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['global-prepare-error-response-sub-flow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 19. Release Subflow: Already Released Direct -->
+    <munit:test name="inventory-release-already-released-direct-test" description="Verifies release subflow when reservation is already RELEASED">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReleaseCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock reservation row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="reservationRows" value="#[[{ reservation_id: 'RES-ALREADY', order_id: 'ORD-01', sku: 'SKU-01', quantity: 1, status: 'RELEASED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "S-01", stepId: "S-01", stepName: "RELEASE_INVENTORY", commandType: "RELEASE", attempt: 1, payload: { orderId: "ORD-01", reservationIds: ["RES-ALREADY"] } }]' />
+                    <munit:variable key="dedupKey" value="#['S-01:RELEASE']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-release-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.inventoryReply.outcome]" expected="#['SUCCESS']" message="Release outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 20. AMQP Reserve Flow: Error Handler -->
+    <munit:test name="inventory-reserve-amqp-error-test" description="Verifies AMQP reserve flow error handler publishes error reply">
+        <munit:behavior>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['inventory-reserver-Sub_Flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="MULE:UNKNOWN" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['inventory-handle-duplicate-race-sub-flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[output application/json --- { outcome: 'FAILED', failureCode: 'RESERVE_ERROR' }]" mediaType="application/json" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-ERR", "stepId": "S-01", "replyTo": "inventory.reserve.reply", "payload": { "orderId": "ORD-01" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="inventory-reserve-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 21. AMQP Release Flow: Error Handler -->
+    <munit:test name="inventory-release-amqp-error-test" description="Verifies AMQP release flow error handler publishes error reply">
+        <munit:behavior>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['inventory-release-Sub_Flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="MULE:UNKNOWN" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['inventory-handle-duplicate-race-sub-flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[output application/json --- { outcome: 'FAILED', failureCode: 'RELEASE_ERROR' }]" mediaType="application/json" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-ERR", "stepId": "S-01", "replyTo": "inventory.release.reply", "payload": { "orderId": "ORD-01" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="inventory-release-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 22. POST /reserve HTTP Flow: Validation Failure (Missing OrderId) -->
+    <munit:test name="inventory-post-reserve-validation-failure-test" description="Verifies POST /reserve returns 400 when orderId is missing">
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-01", "orderId": "", "items": [{ "sku": "SKU-01", "quantity": 1 }] }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\reserve:application\json:inventory-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 500]" expected="#[400]" message="Status should be 400" />
+            <munit-tools:assert-equals actual="#[payload.errorCode]" expected="#['INVALID_REQUEST']" message="Error code should be INVALID_REQUEST" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 23. POST /release HTTP Flow: Error Handler -->
+    <munit:test name="inventory-post-release-flow-error-handler-test" description="Verifies POST /release executes error handler on subflow error">
+        <munit:behavior>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['inventory-release-Sub_Flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="MULE:UNKNOWN" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['global-prepare-error-response-sub-flow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-01", "orderId": "ORD-01" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\release:application\json:inventory-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Handle Duplicate Race or Delegate']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 24. AMQP Reserve Flow: Validation Failure (Missing OrderId) -->
+    <munit:test name="inventory-reserve-amqp-validation-failure-test" description="Verifies AMQP reserve flow publishes failure on missing orderId">
+        <munit:behavior>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-01", "replyTo": "inventory.reserve.reply", "payload": { "orderId": "", "items": [{ "sku": "SKU-01", "quantity": 1 }] } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="inventory-reserve-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[payload.outcome]" expected="#['FAILURE']" message="Outcome should be FAILURE" />
+            <munit-tools:assert-equals actual="#[payload.failureCode]" expected="#['INVALID_REQUEST']" message="Failure code should be INVALID_REQUEST" />
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 25. AMQP Release Flow: Validation Failure (Missing Identifiers) -->
+    <munit:test name="inventory-release-amqp-validation-failure-test" description="Verifies AMQP release flow publishes failure on missing identifiers">
+        <munit:behavior>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-01", "replyTo": "inventory.release.reply", "payload": { "orderId": "", "reservationId": "", "reservationIds": [] } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="inventory-release-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[payload.outcome]" expected="#['FAILURE']" message="Outcome should be FAILURE" />
+            <munit-tools:assert-equals actual="#[payload.failureCode]" expected="#['INVALID_REQUEST']" message="Failure code should be INVALID_REQUEST" />
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 26. Inventory Reserve Subflow: Invalid Command Type -->
+    <munit:test name="inventory-reserve-invalid-command-subflow-test" description="Verifies reserve subflow raises INVENTORY:INVALID_COMMAND when commandType is invalid" expectedErrorType="INVENTORY:INVALID_COMMAND">
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-01", commandType: "INVALID", payload: { orderId: "ORD-01", items: [{ sku: "SKU-01", quantity: 1 }] } }]' />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-reserver-Sub_Flow" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 27. Inventory Reserve Subflow: Command In Progress -->
+    <munit:test name="inventory-reserve-command-in-progress-subflow-test" description="Verifies reserve subflow raises INVENTORY:COMMAND_IN_PROGRESS when result_payload is null" expectedErrorType="INVENTORY:COMMAND_IN_PROGRESS">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReserveCommand" value="#[[{ dedup_key: 'SAGA-CIP-01:S-01:RESERVE', result_payload: null }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-CIP-01", stepId: "S-01", commandType: "RESERVE", payload: { orderId: "ORD-01", items: [{ sku: "SKU-01", quantity: 1 }] } }]' />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-reserver-Sub_Flow" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 28. Inventory Reserve Subflow: Stock Changed / Update Zero Rows -->
+    <munit:test name="inventory-reserve-stock-changed-insufficient-subflow-test" description="Verifies reserve subflow raises INVENTORY:INSUFFICIENT_QUANTITY when stock update affects 0 rows" expectedErrorType="INVENTORY:INSUFFICIENT_QUANTITY">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReserveCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock product stock row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockRows" value="#[[{ sku: 'SKU-01', available_quantity: 10, status: 'ACTIVE' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Decrease available stock']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 0 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockUpdateResult" value="#[{ affectedRows: 0 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-STOCK-CHG-01", stepId: "S-01", commandType: "RESERVE", payload: { orderId: "ORD-01", items: [{ sku: "SKU-01", quantity: 1 }] } }]' />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-reserver-Sub_Flow" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 29. Inventory Release Subflow: Invalid Command -->
+    <munit:test name="inventory-release-invalid-command-subflow-test" description="Verifies release subflow raises INVENTORY:INVALID_COMMAND when identifiers are missing" expectedErrorType="INVENTORY:INVALID_COMMAND">
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-01", payload: { orderId: "", reservationIds: [] } }]' />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-release-Sub_Flow" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 30. Inventory Release Subflow: Command In Progress -->
+    <munit:test name="inventory-release-command-in-progress-subflow-test" description="Verifies release subflow raises INVENTORY:COMMAND_IN_PROGRESS when result_payload is null" expectedErrorType="INVENTORY:COMMAND_IN_PROGRESS">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReleaseCommand" value="#[[{ dedup_key: 'SAGA-CIP-REL:S-01:RELEASE', result_payload: null }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-CIP-REL", stepId: "S-01", payload: { orderId: "ORD-01" } }]' />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-release-Sub_Flow" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 31. Inventory Release Subflow: Replay Cached Response -->
+    <munit:test name="inventory-release-replay-cached-subflow-test" description="Verifies release subflow replays cached response when dedupKey already exists">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReleaseCommand" value="#[[{ dedup_key: 'SAGA-REP-01:S-01:RELEASE', result_payload: '{&quot;outcome&quot;:&quot;SUCCESS&quot;,&quot;stepName&quot;:&quot;RELEASE_INVENTORY&quot;}' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-REP-01", stepId: "S-01", payload: { orderId: "ORD-01" } }]' />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-release-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.inventoryReply.outcome]" expected="#['SUCCESS']" message="Replayed release outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 32. Inventory Release Subflow: Resolve by Order ID -->
+    <munit:test name="inventory-release-by-order-id-subflow-test" description="Verifies release subflow finds reservations by order ID">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReleaseCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Find reservations by order']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="orderReservations" value="#[[{ reservation_id: 'RES-BY-ORD-01' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock reservation row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="reservationRows" value="#[[{ reservation_id: 'RES-BY-ORD-01', order_id: 'ORD-BY-ORD-01', sku: 'SKU-01', quantity: 2, status: 'RESERVED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockRestoreResult" value="#[{ affectedRows: 1 }]" />
+                        <munit-tools:variable key="reservationUpdateResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-REL-ORD-01", stepId: "S-01", payload: { orderId: "ORD-BY-ORD-01" } }]' />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-release-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.inventoryReply.outcome]" expected="#['SUCCESS']" message="Release outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 33. Inventory Release Subflow: Reservation Not Found -->
+    <munit:test name="inventory-release-reservation-not-found-subflow-test" description="Verifies release subflow raises INVENTORY:RESERVATION_NOT_FOUND when reservation row does not exist" expectedErrorType="INVENTORY:RESERVATION_NOT_FOUND">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReleaseCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock reservation row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="reservationRows" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-01", payload: { reservationIds: ["RES-NONEXISTENT"] } }]' />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-release-Sub_Flow" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 34. Inventory Release Subflow: Stock Restore Failed -->
+    <munit:test name="inventory-release-stock-restore-failed-subflow-test" description="Verifies release subflow raises INVENTORY:STOCK_RESTORE_FAILED when stock restore returns 0 rows" expectedErrorType="INVENTORY:STOCK_RESTORE_FAILED">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReleaseCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock reservation row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="reservationRows" value="#[[{ reservation_id: 'RES-01', order_id: 'ORD-01', sku: 'SKU-01', quantity: 1, status: 'RESERVED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Restore available stock']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 0 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockRestoreResult" value="#[{ affectedRows: 0 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-01", payload: { reservationIds: ["RES-01"] } }]' />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-release-Sub_Flow" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 35. Inventory Release Subflow: Reservation Update Failed -->
+    <munit:test name="inventory-release-mark-released-failed-subflow-test" description="Verifies release subflow raises INVENTORY:RESERVATION_UPDATE_FAILED when reservation update returns 0 rows" expectedErrorType="INVENTORY:RESERVATION_UPDATE_FAILED">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReleaseCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock reservation row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="reservationRows" value="#[[{ reservation_id: 'RES-01', order_id: 'ORD-01', sku: 'SKU-01', quantity: 1, status: 'RESERVED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Restore available stock']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stockRestoreResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark reservation released']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 0 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="reservationUpdateResult" value="#[{ affectedRows: 0 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-01", payload: { reservationIds: ["RES-01"] } }]' />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-release-Sub_Flow" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 36. Inventory Release Subflow: Invalid Reservation State -->
+    <munit:test name="inventory-release-invalid-reservation-state-subflow-test" description="Verifies release subflow raises INVENTORY:INVALID_RESERVATION_STATE when status is invalid" expectedErrorType="INVENTORY:INVALID_RESERVATION_STATE">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check previously processed command']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingReleaseCommand" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock reservation row']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="reservationRows" value="#[[{ reservation_id: 'RES-01', order_id: 'ORD-01', sku: 'SKU-01', quantity: 1, status: 'CANCELLED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-01", payload: { reservationIds: ["RES-01"] } }]' />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="inventory-release-Sub_Flow" />
+        </munit:execution>
+    </munit:test>
+
+</mule>

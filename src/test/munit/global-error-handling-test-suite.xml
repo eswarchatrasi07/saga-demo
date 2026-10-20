@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+    <munit:config name="global-error-handling-test-suite.xml" />
+
+    <!-- 1. APIKIT:BAD_REQUEST -->
+    <munit:test name="global-error-apikit-bad-request-test" expectedErrorType="APIKIT:BAD_REQUEST">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:router">
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="APIKIT:BAD_REQUEST" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="inventory-system-api-main" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 2. APIKIT:NOT_FOUND -->
+    <munit:test name="global-error-apikit-not-found-test" expectedErrorType="APIKIT:NOT_FOUND">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:router">
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="APIKIT:NOT_FOUND" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="inventory-system-api-main" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 3. APIKIT:METHOD_NOT_ALLOWED -->
+    <munit:test name="global-error-apikit-method-not-allowed-test" expectedErrorType="APIKIT:METHOD_NOT_ALLOWED">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:router">
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="APIKIT:METHOD_NOT_ALLOWED" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="inventory-system-api-main" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 4. APIKIT:NOT_ACCEPTABLE -->
+    <munit:test name="global-error-apikit-not-acceptable-test" expectedErrorType="APIKIT:NOT_ACCEPTABLE">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:router">
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="APIKIT:NOT_ACCEPTABLE" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="inventory-system-api-main" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 5. APIKIT:UNSUPPORTED_MEDIA_TYPE -->
+    <munit:test name="global-error-apikit-unsupported-media-type-test" expectedErrorType="APIKIT:UNSUPPORTED_MEDIA_TYPE">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:router">
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="APIKIT:UNSUPPORTED_MEDIA_TYPE" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="inventory-system-api-main" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 6. APIKIT:NOT_IMPLEMENTED -->
+    <munit:test name="global-error-apikit-not-implemented-test" expectedErrorType="APIKIT:NOT_IMPLEMENTED">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:router">
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="APIKIT:NOT_IMPLEMENTED" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="inventory-system-api-main" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 7. DB:CONNECTIVITY (Transient 503) -->
+    <munit:test name="global-error-db-connectivity-test" expectedErrorType="DB:CONNECTIVITY">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:router">
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="DB:CONNECTIVITY" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="inventory-system-api-main" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 8. DB:QUERY_EXECUTION (Non-transient 500) -->
+    <munit:test name="global-error-db-query-execution-test" expectedErrorType="DB:QUERY_EXECUTION">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:router">
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="DB:QUERY_EXECUTION" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="inventory-system-api-main" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 9. Catch-All ANY -->
+    <munit:test name="global-error-any-test" expectedErrorType="MULE:EXPRESSION">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:router">
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="MULE:EXPRESSION" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="inventory-system-api-main" />
+        </munit:execution>
+    </munit:test>
+
+</mule>

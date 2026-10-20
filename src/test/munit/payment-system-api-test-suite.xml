@@ -1,0 +1,793 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+    <munit:config name="payment-system-api-test-suite.xml" />
+
+    <!-- 1. Payment Charge: Happy Path (SUCCESS) -->
+    <munit:test name="payment-charge-success-test" description="Verifies successful payment charge authorization">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingCharge" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-02", stepName: "CHARGE_PAYMENT", commandType: "CHARGE", attempt: 1, payload: { orderId: "ORD-01", amount: 2000.00, currency: "INR", cardToken: "TKN-VALID-SUCCESS" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-02:CHARGE']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="payment-charge-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.paymentReply.outcome]" expected="#['SUCCESS']" message="Payment outcome should be SUCCESS" />
+            <munit-tools:assert-that expression="#[vars.paymentReply.result.paymentId]" is="#[MunitTools::notNullValue()]" message="Payment ID must be generated" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 2. Payment Charge: Declined Card (FAILURE) -->
+    <munit:test name="payment-charge-declined-test" description="Verifies card decline produces non-retryable business failure">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingCharge" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-02", stepName: "CHARGE_PAYMENT", commandType: "CHARGE", attempt: 1, payload: { orderId: "ORD-01", amount: 2000.00, currency: "INR", cardToken: "DECLINE-INSUFFICIENT-FUNDS" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-02:CHARGE']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="payment-charge-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.paymentReply.outcome]" expected="#['FAILURE']" message="Outcome should be FAILURE" />
+            <munit-tools:assert-equals actual="#[vars.paymentReply.failureCode]" expected="#['PAYMENT_DECLINED']" message="Failure code should be PAYMENT_DECLINED" />
+            <munit-tools:assert-equals actual="#[vars.paymentReply.retryable]" expected="#[false]" message="Business error should not be retryable" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 3. Payment Charge: Idempotent Replay -->
+    <munit:test name="payment-charge-idempotent-replay-test" description="Verifies cached response returned on duplicate charge command">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingCharge" value="#[[{ dedup_key: 'SAGA-01:S-02:CHARGE', result_payload: '{ &quot;outcome&quot;: &quot;SUCCESS&quot;, &quot;paymentId&quot;: &quot;PAY-CACHED-99&quot; }' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-02", stepName: "CHARGE_PAYMENT", commandType: "CHARGE", attempt: 1, payload: { orderId: "ORD-01", amount: 2000.00, currency: "INR", cardToken: "TKN-VALID" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-02:CHARGE']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="payment-charge-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.paymentReply.paymentId]" expected="#['PAY-CACHED-99']" message="Replayed paymentId should match cached record" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 4. Payment Refund: Happy Path (SUCCESS) -->
+    <munit:test name="payment-refund-success-test" description="Verifies refund compensation marks transaction as REFUNDED">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingRefund" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="paymentRows" value="#[[{ payment_id: 'PAY-01', order_id: 'ORD-01', amount: 2000.00, currency: 'INR', status: 'CHARGED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-02", stepName: "REFUND_PAYMENT", commandType: "REFUND", attempt: 1, payload: { orderId: "ORD-01" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-02:REFUND']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="payment-refund-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.refundReply.outcome]" expected="#['SUCCESS']" message="Refund outcome should be SUCCESS" />
+            <munit-tools:assert-that expression="#[vars.refundReply.result.refundRef]" is="#[MunitTools::notNullValue()]" message="Refund reference must be generated" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 5. Payment Refund: Already Refunded Branch -->
+    <munit:test name="payment-refund-already-refunded-test" description="Verifies already REFUNDED status produces idempotent success">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingRefund" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="paymentRows" value="#[[{ payment_id: 'PAY-01', order_id: 'ORD-01', amount: 2000.00, currency: 'INR', status: 'REFUNDED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-02", stepName: "REFUND_PAYMENT", commandType: "REFUND", attempt: 1, payload: { orderId: "ORD-01" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-02:REFUND']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="payment-refund-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.refundReply.outcome]" expected="#['SUCCESS']" message="Refund outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 6. POST /payments/charge: HTTP Endpoint Happy Path (200 OK) -->
+    <munit:test name="payment-post-charge-http-success-test" description="Verifies POST /payments/charge HTTP router and response">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingCharge" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-02", "orderId": "ORD-01", "amount": 2500.00, "currency": "INR", "cardToken": "TKN-VALID" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\payments\charge:application\json:payment-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[200]" message="HTTP Status should be 200" />
+            <munit-tools:assert-equals actual="#[payload.outcome]" expected="#['SUCCESS']" message="Outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 7. POST /payments/charge: HTTP Validation Error (400) -->
+    <munit:test name="payment-post-charge-validation-error-test" description="Verifies 400 Bad Request on invalid request">
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-VAL-ERR", "stepId": "S-VAL-ERR", "orderId": "", "cardToken": "" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\payments\charge:application\json:payment-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 500]" expected="#[400]" message="Status should be 400" />
+            <munit-tools:assert-equals actual="#[payload.failureCode]" expected="#['INVALID_REQUEST']" message="Failure code should be INVALID_REQUEST" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 8. POST /payments/refund: HTTP Endpoint Happy Path (200 OK) -->
+    <munit:test name="payment-post-refund-http-success-test" description="Verifies POST /payments/refund HTTP router and response">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingRefund" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="paymentRows" value="#[[{ payment_id: 'PAY-01', order_id: 'ORD-01', amount: 2000.00, currency: 'INR', status: 'CHARGED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-02", "orderId": "ORD-01" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\payments\refund:application\json:payment-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[200]" message="HTTP Status should be 200" />
+            <munit-tools:assert-equals actual="#[payload.outcome]" expected="#['SUCCESS']" message="Outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 9. POST /payments/refund: HTTP Validation Error (400) -->
+    <munit:test name="payment-post-refund-validation-error-test" description="Verifies 400 Bad Request on missing orderId and paymentId">
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-02" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\payments\refund:application\json:payment-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 500]" expected="#[400]" message="Status should be 400" />
+            <munit-tools:assert-equals actual="#[payload.failureCode]" expected="#['INVALID_REQUEST']" message="Failure code should be INVALID_REQUEST" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 10. AMQP Charge Flow: Success -->
+    <munit:test name="payment-charge-amqp-success-test" description="Verifies payment charge AMQP command listener">
+        <munit:behavior>
+            <munit-tools:mock-when processor="amqp:publish" />
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingCharge" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-02", "replyTo": "payment.charge.reply", "payload": { "orderId": "ORD-01", "amount": 2000.00, "currency": "INR", "cardToken": "TKN-VALID" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="payment-charge-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.paymentReply.outcome]" expected="#['SUCCESS']" message="AMQP response outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 11. AMQP Refund Flow: Success -->
+    <munit:test name="payment-refund-amqp-success-test" description="Verifies payment refund AMQP compensation listener">
+        <munit:behavior>
+            <munit-tools:mock-when processor="amqp:publish" />
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingRefund" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="paymentRows" value="#[[{ payment_id: 'PAY-01', order_id: 'ORD-01', amount: 2000.00, currency: 'INR', status: 'CHARGED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-02", "replyTo": "payment.refund.reply", "payload": { "orderId": "ORD-01" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="payment-refund-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.refundReply.outcome]" expected="#['SUCCESS']" message="AMQP refund outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 12. Main Router Flow -->
+    <munit:test name="payment-system-main-flow-test" description="Verifies payment system main APIKit router execution">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:router">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[output application/json --- { status: 'OK' }]" mediaType="application/json" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="payment-system-api-main" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="apikit:router" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 13. Duplicate Race Subflow: Winner Available -->
+    <munit:test name="payment-duplicate-race-winner-available-test" description="Verifies duplicate race handles existing winner response">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Read winner response']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="raceCheckResult" value="#[[{ result_payload: '{ &quot;outcome&quot;: &quot;SUCCESS&quot;, &quot;paymentId&quot;: &quot;PAY-RACE-01&quot; }' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="dedupKey" value="#['DEDUP-RACE-01']" />
+                </munit:variables>
+            </munit:set-event>
+            <try>
+                <raise-error type="APP:DUPLICATE" description="Duplicate entry 'DEDUP-RACE-01' for key PRIMARY" />
+                <error-handler>
+                    <on-error-continue>
+                        <flow-ref name="payment-handle-duplicate-race-sub-flow" />
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[200]" message="Status should be 200" />
+            <munit-tools:assert-equals actual="#[payload.outcome]" expected="#['SUCCESS']" message="Outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 14. Duplicate Race Subflow: Winner In Progress (409) -->
+    <munit:test name="payment-duplicate-race-winner-empty-test" description="Verifies duplicate race handles conflict when winner not yet written">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Read winner response']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="raceCheckResult" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="dedupKey" value="#['DEDUP-RACE-02']" />
+                    <munit:variable key="command" value="#[{ stepId: 'STEP-RACE-02' }]" />
+                </munit:variables>
+            </munit:set-event>
+            <try>
+                <raise-error type="APP:DUPLICATE" description="Duplicate entry for dedup_key" />
+                <error-handler>
+                    <on-error-continue>
+                        <flow-ref name="payment-handle-duplicate-race-sub-flow" />
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 500]" expected="#[409]" message="Status should be 409" />
+            <munit-tools:assert-equals actual="#[payload.failureCode]" expected="#['COMMAND_IN_PROGRESS']" message="Failure code should be COMMAND_IN_PROGRESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 15. Duplicate Race Subflow: Non-Duplicate Fallback -->
+    <munit:test name="payment-duplicate-race-non-duplicate-test" description="Verifies duplicate race delegates other errors to global handler">
+        <munit:behavior>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['global-prepare-error-response-sub-flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return />
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <try>
+                <raise-error type="APP:DB_ERROR" description="Database connection dropped" />
+                <error-handler>
+                    <on-error-continue>
+                        <flow-ref name="payment-handle-duplicate-race-sub-flow" />
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="flow-ref" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['global-prepare-error-response-sub-flow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 16. Refund Subflow: Payment Not Found -->
+    <munit:test name="payment-refund-not-found-test" description="Verifies PAYMENT:PAYMENT_NOT_FOUND when payment row does not exist" expectedErrorType="PAYMENT:PAYMENT_NOT_FOUND">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingRefund" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by PaymentId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="paymentRows" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "S-01", "stepId": "STEP-02", "payload": { "paymentId": "PAY-NONEXISTENT" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="payment-refund-Sub_Flow" />
+        </munit:execution>
+    </munit:test>
+
+    <!-- 18. AMQP Charge Flow: Error Handler -->
+    <munit:test name="payment-charge-amqp-error-test" description="Verifies AMQP charge flow error handler publishes error reply">
+        <munit:behavior>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['payment-charge-Sub_Flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="MULE:UNKNOWN" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-ERR", "stepId": "S-02", "replyTo": "payment.charge.reply", "payload": { "orderId": "ORD-01", "amount": 100, "cardToken": "TKN" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="payment-charge-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 19. AMQP Refund Flow: Error Handler -->
+    <munit:test name="payment-refund-amqp-error-test" description="Verifies AMQP refund flow error handler publishes error reply">
+        <munit:behavior>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['payment-refund-Sub_Flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="MULE:UNKNOWN" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-ERR", "stepId": "S-02", "replyTo": "payment.refund.reply", "payload": { "orderId": "ORD-01" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="payment-refund-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 20. AMQP Charge Flow: Validation Failure (Invalid Payload) -->
+    <munit:test name="payment-charge-amqp-validation-failure-test" description="Verifies AMQP charge flow validation failure publishes error reply">
+        <munit:behavior>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-02", "replyTo": "payment.charge.reply", "payload": { "orderId": "", "amount": -10, "cardToken": "" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="payment-charge-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[payload.outcome]" expected="#['FAILURE']" message="Outcome should be FAILURE" />
+            <munit-tools:assert-equals actual="#[payload.failureCode]" expected="#['INVALID_REQUEST']" message="Failure code should be INVALID_REQUEST" />
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 21. AMQP Refund Flow: Validation Failure (Missing Identifiers) -->
+    <munit:test name="payment-refund-amqp-validation-failure-test" description="Verifies AMQP refund flow validation failure publishes error reply">
+        <munit:behavior>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-02", "replyTo": "payment.refund.reply", "payload": { "orderId": "", "paymentId": "" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="payment-refund-amqp-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[payload.outcome]" expected="#['FAILURE']" message="Outcome should be FAILURE" />
+            <munit-tools:assert-equals actual="#[payload.failureCode]" expected="#['INVALID_REQUEST']" message="Failure code should be INVALID_REQUEST" />
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 22. POST /payments/charge HTTP Flow: Error Handler -->
+    <munit:test name="payment-post-charge-flow-error-handler-test" description="Verifies POST /payments/charge catches subflow error and executes flow error handler">
+        <munit:behavior>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['payment-charge-Sub_Flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="MULE:UNKNOWN" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['global-prepare-error-response-sub-flow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-02", "orderId": "ORD-01", "amount": 2500.00, "currency": "INR", "cardToken": "TKN-VALID" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\payments\charge:application\json:payment-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Handle Payment Duplicate Race or Delegate']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 23. POST /payments/refund HTTP Flow: Error Handler -->
+    <munit:test name="payment-post-refund-flow-error-handler-test" description="Verifies POST /payments/refund catches subflow error and executes flow error handler">
+        <munit:behavior>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['payment-refund-Sub_Flow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="MULE:UNKNOWN" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['global-prepare-error-response-sub-flow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "S-02", "orderId": "ORD-01" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\payments\refund:application\json:payment-system-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Handle Payment Duplicate Race or Delegate']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 24. Payment Refund Subflow: Refund by Payment ID -->
+    <munit:test name="payment-refund-by-payment-id-subflow-test" description="Verifies refund subflow looks up by payment ID when orderId is omitted">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingRefund" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by PaymentId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="paymentRows" value="#[[{ payment_id: 'PAY-01', order_id: 'ORD-01', amount: 1500.00, currency: 'INR', status: 'CHARGED', gateway_ref: 'GW-01', refund_ref: null }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-02", stepName: "REFUND_PAYMENT", commandType: "REFUND", attempt: 1, payload: { paymentId: "PAY-01" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-02:REFUND']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="payment-refund-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.refundReply.outcome]" expected="#['SUCCESS']" message="Refund outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 25. Payment Refund Subflow: Replay Cached Response -->
+    <munit:test name="payment-refund-replay-cached-subflow-test" description="Verifies refund subflow replays cached response when dedupKey already processed">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingRefund" value="#[[{ dedup_key: 'SAGA-01:S-02:REFUND', result_payload: '{&quot;outcome&quot;:&quot;SUCCESS&quot;,&quot;stepName&quot;:&quot;REFUND_PAYMENT&quot;}' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-02", stepName: "REFUND_PAYMENT", commandType: "REFUND", attempt: 1, payload: { orderId: "ORD-01" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-02:REFUND']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="payment-refund-Sub_Flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.refundReply.outcome]" expected="#['SUCCESS']" message="Replayed refund outcome should be SUCCESS" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 26. Payment Refund Subflow: Invalid Payment State -->
+    <munit:test name="payment-refund-invalid-state-subflow-test" description="Verifies refund subflow raises PAYMENT:INVALID_PAYMENT_STATE when state is invalid" expectedErrorType="PAYMENT:INVALID_PAYMENT_STATE">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check processed commands']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingRefund" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Lock by OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="paymentRows" value="#[[{ payment_id: 'PAY-01', order_id: 'ORD-01', status: 'PENDING' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="command" value='#[{ correlationId: "c1", sagaId: "SAGA-01", stepId: "S-02", stepName: "REFUND_PAYMENT", commandType: "REFUND", attempt: 1, payload: { orderId: "ORD-01" } }]' />
+                    <munit:variable key="dedupKey" value="#['SAGA-01:S-02:REFUND']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="payment-refund-Sub_Flow" />
+        </munit:execution>
+    </munit:test>
+
+</mule>

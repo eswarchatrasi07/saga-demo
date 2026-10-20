@@ -1,0 +1,1408 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+    <munit:config name="saga-orchestrator-test-suite.xml" />
+
+    <!-- 1. Duplicate Saga Initiation Test (409 Conflict) -->
+    <munit:test name="saga-duplicate-initiation-test" description="Verifies rejection of duplicate order ID with HTTP 409">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Query Existing Saga By OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingSaga" value="#[[{ saga_id: 'SAGA-EXISTING', saga_state: 'COMPLETED', correlation_id: 'corr-123' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "orderId": "ORD-DUPLICATE", "customerId": "CUST-01", "totalAmount": 1000.00, "items": [{"sku": "SKU-TSHIRT-BLK-M", "quantity": 1, "unitPrice": 1000.00}], "payment": {"method": "CARD", "cardToken": "TKN-VALID"}, "shipping": {"addressLine1": "Street", "city": "City", "state": "ST", "postalCode": "600002", "country": "India"} }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\sagas\order-fulfilment:application\json:saga-process-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[409]" message="Status should be 409 Conflict" />
+            <munit-tools:assert-equals actual="#[payload.errorCode]" expected="#['DUPLICATE_ORDER_ID']" message="Error code should be DUPLICATE_ORDER_ID" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 2. Happy Path Saga Initiation & Terminal Success (200 OK) -->
+    <munit:test name="saga-initiation-happy-path-test" description="Verifies saga creation, step dispatch, and synchronous 200 completion">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Query Existing Saga By OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingSaga" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Query Terminal State']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="terminalSaga" value="#[[{ saga_id: 'SAGA-2026-TEST01', order_id: 'ORD-HAPPY-01', saga_state: 'COMPLETED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Select Saga Steps']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stepRows" value="#[[{ step_sequence: 1, step_name: 'RESERVE_INVENTORY', step_state: 'COMPLETED', attempt_count: 1, compensation_state: 'NOT_REQUIRED' }, { step_sequence: 2, step_name: 'CHARGE_PAYMENT', step_state: 'COMPLETED', attempt_count: 1, compensation_state: 'NOT_REQUIRED' }, { step_sequence: 3, step_name: 'DISPATCH_SHIPPING', step_state: 'COMPLETED', attempt_count: 1, compensation_state: 'NOT_REQUIRED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "orderId": "ORD-HAPPY-01", "customerId": "CUST-01", "totalAmount": 2000.00, "items": [{"sku": "SKU-TSHIRT-BLK-M", "quantity": 2, "unitPrice": 1000.00}], "payment": {"method": "CARD", "cardToken": "TKN-VALID"}, "shipping": {"addressLine1": "Street", "city": "City", "state": "ST", "postalCode": "600002", "country": "India"} }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\sagas\order-fulfilment:application\json:saga-process-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[200]" message="Status should be 200 OK" />
+            <munit-tools:assert-equals actual="#[payload.sagaState]" expected="#['COMPLETED']" message="Saga state should be COMPLETED" />
+            <munit-tools:assert-that expression="#[payload.steps]" is="#[MunitTools::notNullValue()]" message="Steps array should be populated" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 3. Query Saga Status: Found (200 OK) -->
+    <munit:test name="saga-query-status-found-test" description="Verifies retrieving durable saga status by sagaId">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Select Saga Instance']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="sagaInstance" value="#[[{ saga_id: 'SAGA-2026-STATUS', order_id: 'ORD-01', saga_state: 'COMPLETED', correlation_id: 'corr-01', started_at: now() }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Select Saga Steps for Status']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="sagaSteps" value="#[[{ step_sequence: 1, step_name: 'RESERVE_INVENTORY', step_state: 'COMPLETED', attempt_count: 1, compensation_state: 'NOT_REQUIRED' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:attributes value="#[{ uriParams: { sagaId: 'SAGA-2026-STATUS' } }]" />
+            </munit:set-event>
+            <flow-ref name="get:\sagas\(sagaId):saga-process-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[200]" message="Status should be 200" />
+            <munit-tools:assert-equals actual="#[payload.sagaId]" expected="#['SAGA-2026-STATUS']" message="Saga ID should match" />
+            <munit-tools:assert-equals actual="#[payload.sagaState]" expected="#['COMPLETED']" message="Saga state should be COMPLETED" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 4. Query Saga Status: Not Found (404) -->
+    <munit:test name="saga-query-status-not-found-test" description="Verifies 404 response when saga ID does not exist">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Select Saga Instance']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="sagaInstance" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:attributes value="#[{ uriParams: { sagaId: 'SAGA-NONEXISTENT' } }]" />
+            </munit:set-event>
+            <flow-ref name="get:\sagas\(sagaId):saga-process-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 200]" expected="#[404]" message="Status should be 404" />
+            <munit-tools:assert-equals actual="#[payload.errorCode]" expected="#['SAGA_NOT_FOUND']" message="Error code should be SAGA_NOT_FOUND" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 5. Step 1 Dispatch Subflow Directly -->
+    <munit:test name="saga-dispatch-step1-subflow-test" description="Verifies dispatching step 1 updates DB and publishes AMQP command">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="sagaId" value="#['SAGA-TEST-DISP1']" />
+                    <munit:variable key="corrId" value="#['c1']" />
+                    <munit:variable key="clientReq" value="#[{ orderId: 'ORD-01', items: [{ sku: 'SKU-1', quantity: 2 }] }]" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="saga-dispatch-step1-subflow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 6. Step 2 Dispatch Subflow Directly -->
+    <munit:test name="saga-dispatch-step2-subflow-test" description="Verifies dispatching step 2 updates DB and publishes charge command">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="sagaRow" value="#[[{ request_payload: '{ &quot;totalAmount&quot;: 2000, &quot;customerId&quot;: &quot;C1&quot;, &quot;orderId&quot;: &quot;ORD-01&quot;, &quot;payment&quot;: { &quot;cardToken&quot;: &quot;TKN-1&quot; } }', correlation_id: 'c1' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="reply" value="#[{ sagaId: 'SAGA-TEST-DISP2' }]" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="saga-dispatch-step2-subflow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 7. Step 3 Dispatch Subflow Directly -->
+    <munit:test name="saga-dispatch-step3-subflow-test" description="Verifies dispatching step 3 updates DB and publishes shipping command">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="sagaRow" value="#[[{ request_payload: '{ &quot;orderId&quot;: &quot;ORD-01&quot;, &quot;shipping&quot;: { &quot;addressLine1&quot;: &quot;Main St&quot;, &quot;city&quot;: &quot;City&quot;, &quot;state&quot;: &quot;ST&quot;, &quot;postalCode&quot;: &quot;600002&quot;, &quot;country&quot;: &quot;India&quot; } }', correlation_id: 'c1' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="reply" value="#[{ sagaId: 'SAGA-TEST-DISP3' }]" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="saga-dispatch-step3-subflow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 8. Payment Refund Compensation Subflow Directly -->
+    <munit:test name="saga-compensate-payment-subflow-test" description="Verifies refund compensation command is published">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step2Result" value="#[[{ result_payload: '{ &quot;paymentId&quot;: &quot;PAY-01&quot;, &quot;orderId&quot;: &quot;ORD-01&quot; }' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="reply" value="#[{ sagaId: 'SAGA-COMP-PAY' }]" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="saga-compensate-payment-subflow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 9. Inventory Release Compensation Subflow Directly -->
+    <munit:test name="saga-compensate-inventory-subflow-test" description="Verifies inventory release compensation command is published">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step1Result" value="#[[{ result_payload: '{ &quot;reservationId&quot;: &quot;RES-01&quot;, &quot;reservationIds&quot;: [&quot;RES-01&quot;] }' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="activeSagaId" value="#['SAGA-COMP-INV']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="saga-compensate-inventory-subflow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 10. Payment Refund Reply Listener Flow -->
+    <munit:test name="saga-payment-refund-reply-listener-test" description="Verifies payment refund reply listener transitions state and calls inventory release">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="refundUpdateResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['saga-compensate-inventory-subflow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return />
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-2", "outcome": "SUCCESS" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="payment-refund-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="flow-ref" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['saga-compensate-inventory-subflow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 11. Inventory Release Reply Listener Flow -->
+    <munit:test name="saga-inventory-release-reply-listener-test" description="Verifies inventory release reply marks saga instance COMPENSATED">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="releaseUpdateResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-1", "outcome": "SUCCESS" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="inventory-release-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update" times="2" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 12. DLQ Routing Subflow Directly -->
+    <munit:test name="saga-route-to-dlq-test" description="Verifies failed compensation marks COMPENSATION_FAILED and routes to DLQ">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="activeSagaId" value="#['SAGA-DLQ-01']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="saga-route-to-dlq-subflow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 13. Saga Stuck Monitoring Flow -->
+    <munit:test name="saga-stuck-monitoring-flow-test" description="Verifies periodic monitor finds stuck sagas and logs alerts">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stuckSagas" value="#[[{ saga_id: 'SAGA-STUCK-01', order_id: 'ORD-STUCK', saga_state: 'STEP_IN_PROGRESS', current_step: 1, elapsed_seconds: 180 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="saga-stuck-monitoring-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:select" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 14. Step 1 Business Failure: Marks Saga COMPENSATED with Zero Rollbacks -->
+    <munit:test name="saga-step1-business-failure-test" description="Verifies step 1 failure marks saga COMPENSATED immediately">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check Step 1 Attempt']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step1Record" value="#[[{ attempt_count: 1 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step1FailResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-1", "outcome": "FAILURE", "failureCode": "INSUFFICIENT_STOCK", "failureMessage": "Out of stock", "retryable": false, "completedAt": "2026-10-20T10:00:00Z" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="inventory-reserve-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update" times="2" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 15. Step 2 Payment Success Advances to Step 3 Shipping -->
+    <munit:test name="saga-step2-success-advances-to-step3-test" description="Verifies payment success triggers shipping dispatch">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step2UpdateResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['saga-dispatch-step3-subflow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return />
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-2", "outcome": "SUCCESS", "completedAt": "2026-10-20T10:00:00Z", "result": { "paymentId": "PAY-01" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="payment-charge-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="flow-ref" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['saga-dispatch-step3-subflow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 16. Step 3 Shipping Success Marks Saga Completed -->
+    <munit:test name="saga-step3-success-completes-saga-test" description="Verifies shipping success marks step 3 and saga instance COMPLETED">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step3UpdateResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-3", "outcome": "SUCCESS", "completedAt": "2026-10-20T10:00:00Z", "result": { "trackingNumber": "TRK-01" } }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="shipping-dispatch-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update" times="2" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 17. Timeout Watchdog: Detects Expired Step and Triggers Compensation -->
+    <munit:test name="saga-timeout-watchdog-detection-test" description="Verifies scheduler detects timed out steps and initiates rollback">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Find Timed-out Steps']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="timedOutSteps" value="#[[{ step_id: 'S-01', saga_id: 'SAGA-TIMEDOUT', step_sequence: 2, step_name: 'CHARGE_PAYMENT' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stepTimeoutResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['saga-compensate-inventory-subflow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return />
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="saga-timeout-watchdog-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="flow-ref" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['saga-compensate-inventory-subflow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 18. Process API Main Router Flow -->
+    <munit:test name="saga-process-api-main-flow-test" description="Verifies saga process APIKit router execution">
+        <munit:behavior>
+            <munit-tools:mock-when processor="apikit:router">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[output application/json --- { status: 'OK' }]" mediaType="application/json" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="saga-process-api-main" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="apikit:router" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 19. Dead Letter Queue Listener Flow -->
+    <munit:test name="saga-dlq-listener-flow-test" description="Verifies dead-letter queue listener updates database with poison message audit">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "sagaId": "SAGA-DLQ-01", "correlationId": "c1", "event": "COMPENSATION_FAILURE_EXHAUSTED" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="saga-dead-letter-queue-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 20. Payment Charge Reply Listener: Non-Retryable Failure (Triggers Inventory Compensation) -->
+    <munit:test name="saga-payment-reply-failure-non-retryable-test" description="Verifies payment failure initiates backward compensation to inventory">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check Step 2 Attempt']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step2Record" value="#[[{ attempt_count: 1 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step2FailResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['saga-compensate-inventory-subflow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return />
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-PAY-FAIL", "stepId": "SAGA-PAY-FAIL-STEP-2", "outcome": "FAILED", "retryable": false, "failureCode": "PAYMENT_DECLINED", "failureMessage": "Card declined" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="payment-charge-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="flow-ref" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['saga-compensate-inventory-subflow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 21. Payment Charge Reply Listener: Retryable Failure -->
+    <munit:test name="saga-payment-reply-failure-retryable-test" description="Verifies retryable payment failure republishes charge command">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check Step 2 Attempt']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step2Record" value="#[[{ attempt_count: 1 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Get Saga 2 Payload']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="saga2Row" value="#[[{ request_payload: '{ &quot;orderId&quot;: &quot;ORD-01&quot;, &quot;totalAmount&quot;: 100, &quot;currency&quot;: &quot;INR&quot;, &quot;payment&quot;: { &quot;cardToken&quot;: &quot;TKN-01&quot; } }', correlation_id: 'c1' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value="#[output application/java --- { correlationId: 'c1', sagaId: 'SAGA-PAY-RETRY', stepId: 'SAGA-PAY-RETRY-STEP-2', outcome: 'FAILED', retryable: true }]" mediaType="application/java" />
+            </munit:set-event>
+            <flow-ref name="payment-charge-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 22. Shipping Dispatch Reply Listener: Non-Retryable Failure (Triggers Payment Refund) -->
+    <munit:test name="saga-shipping-reply-failure-non-retryable-test" description="Verifies shipping failure initiates backward compensation to payment">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check Step 3 Attempt']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step3Record" value="#[[{ attempt_count: 1 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step3FailResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['saga-compensate-payment-subflow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return />
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-SHIP-FAIL", "stepId": "SAGA-SHIP-FAIL-STEP-3", "outcome": "FAILED", "retryable": false, "failureCode": "ADDRESS_INVALID", "failureMessage": "Address unserviceable" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="shipping-dispatch-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="flow-ref" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['saga-compensate-payment-subflow']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 23. Shipping Dispatch Reply Listener: Retryable Failure -->
+    <munit:test name="saga-shipping-reply-failure-retryable-test" description="Verifies retryable shipping failure republishes dispatch command">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check Step 3 Attempt']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step3Record" value="#[[{ attempt_count: 1 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Get Saga 3 Payload']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="saga3Row" value="#[[{ request_payload: '{ &quot;orderId&quot;: &quot;ORD-01&quot;, &quot;shipping&quot;: { &quot;addressLine1&quot;: &quot;Main St&quot; } }', correlation_id: 'c1' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value="#[output application/java --- { correlationId: 'c1', sagaId: 'SAGA-SHIP-RETRY', stepId: 'SAGA-SHIP-RETRY-STEP-3', outcome: 'FAILED', retryable: true }]" mediaType="application/java" />
+            </munit:set-event>
+            <flow-ref name="shipping-dispatch-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 24. Inventory Reserve Reply Listener: Non-Retryable Failure (Step 1 Failure -> Saga COMPENSATED) -->
+    <munit:test name="saga-inventory-reply-failure-non-retryable-test" description="Verifies Step 1 failure terminates saga as COMPENSATED directly">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check Step 1 Attempt']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step1Record" value="#[[{ attempt_count: 1 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step1FailResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-INV-FAIL", "stepId": "SAGA-INV-FAIL-STEP-1", "outcome": "FAILED", "retryable": false, "failureCode": "INSUFFICIENT_STOCK", "failureMessage": "Stock unavailable" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="inventory-reserve-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update" times="2" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 25. Inventory Reserve Reply Listener: Retryable Failure -->
+    <munit:test name="saga-inventory-reply-failure-retryable-test" description="Verifies retryable inventory failure republishes reserve command">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check Step 1 Attempt']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step1Record" value="#[[{ attempt_count: 1 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Get Saga 1 Payload']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="saga1Row" value="#[[{ request_payload: '{ &quot;orderId&quot;: &quot;ORD-01&quot;, &quot;items&quot;: [] }', correlation_id: 'c1' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish" />
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value="#[output application/java --- { correlationId: 'c1', sagaId: 'SAGA-INV-RETRY', stepId: 'SAGA-INV-RETRY-STEP-1', outcome: 'FAILED', retryable: true }]" mediaType="application/java" />
+            </munit:set-event>
+            <flow-ref name="inventory-reserve-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 26. Order Fulfilment: Terminal COMPENSATED State (409 Conflict) -->
+    <munit:test name="saga-order-fulfilment-terminal-compensated-test" description="Verifies synchronous endpoint returns 409 when saga terminates in COMPENSATED state">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Query Existing Saga By OrderId']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="existingSaga" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:insert">
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="flow-ref">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="name" whereValue="#['saga-dispatch-step1-subflow']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return />
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Query Terminal State']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="terminalSaga" value="#[[{ saga_id: 'SAGA-COMP-01', order_id: 'ORD-01', saga_state: 'COMPENSATED', failure_code: 'INSUFFICIENT_STOCK', failure_message: 'Out of stock' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Select Saga Steps']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stepRows" value="#[[{ step_sequence: 1, step_name: 'RESERVE_INVENTORY', step_state: 'FAILED', attempt_count: 1, compensation_state: 'NOT_REQUIRED', failure_code: 'INSUFFICIENT_STOCK', command_sent_at: '2026-10-20T00:00:00Z', reply_received_at: '2026-10-20T00:00:01Z', compensated_at: null }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "orderId": "ORD-COMP-01", "customerId": "CUST-01", "totalAmount": 1000.00, "items": [{"sku": "SKU-TSHIRT-BLK-M", "quantity": 100, "unitPrice": 1000.00}], "payment": {"method": "CARD", "cardToken": "TKN-VALID"}, "shipping": {"addressLine1": "Street 1", "city": "Chennai", "state": "TN", "postalCode": "600002", "country": "India"} }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="post:\sagas\order-fulfilment:application\json:saga-process-api-config" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.httpStatus as Number default 500]" expected="#[409]" message="Status should be 409 Conflict" />
+            <munit-tools:assert-equals actual="#[payload.sagaState]" expected="#['COMPENSATED']" message="Saga state should be COMPENSATED" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- 27. Step 1 Inventory Success Advances to Step 2 Payment -->
+    <munit:test name="saga-step1-success-advances-to-step2-test" description="Verifies inventory success triggers payment step 2 dispatch">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 1 COMPLETED']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step1UpdateResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Fetch Original Request Payload']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="sagaRow" value="#[[{ request_payload: '{&quot;orderId&quot;:&quot;ORD-01&quot;,&quot;totalAmount&quot;:1000.00,&quot;payment&quot;:{&quot;cardToken&quot;:&quot;TKN-01&quot;}}', correlation_id: 'c1' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 2 In Progress']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Update current_step = 2']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Publish payment.charge.command']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-1", "outcome": "SUCCESS", "result": { "reservationId": "RES-01" }, "completedAt": "2026-10-20T10:00:00Z" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="inventory-reserve-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Publish payment.charge.command']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 28. Step 1 Inventory Duplicate Reply (0 rows affected) -->
+    <munit:test name="saga-step1-duplicate-reply-warning-test" description="Verifies duplicate step 1 reply logs warning without advancing">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 1 COMPLETED']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 0 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step1UpdateResult" value="#[{ affectedRows: 0 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-1", "outcome": "SUCCESS", "result": { "reservationId": "RES-01" }, "completedAt": "2026-10-20T10:00:00Z" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="inventory-reserve-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 1 COMPLETED']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 29. Step 2 Payment Duplicate Reply (0 rows affected) -->
+    <munit:test name="saga-step2-duplicate-reply-warning-test" description="Verifies duplicate step 2 reply logs warning without advancing">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 2 COMPLETED']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 0 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step2UpdateResult" value="#[{ affectedRows: 0 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-2", "outcome": "SUCCESS", "result": { "paymentId": "PAY-01" }, "completedAt": "2026-10-20T10:00:00Z" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="payment-charge-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 2 COMPLETED']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 30. Step 2 Payment Duplicate Failure (0 rows affected) -->
+    <munit:test name="saga-step2-duplicate-failure-warning-test" description="Verifies duplicate step 2 failure logs warning when 0 rows updated">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check Step 2 Attempt']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step2Record" value="#[[{ attempt_count: 3 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 2 FAILED']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 0 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step2FailResult" value="#[{ affectedRows: 0 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-2", "outcome": "FAILURE", "failureCode": "CARD_DECLINED", "failureMessage": "Card declined", "retryable": false, "completedAt": "2026-10-20T10:00:00Z" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="payment-charge-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 2 FAILED']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 31. Step 3 Shipping Duplicate Reply (0 rows affected) -->
+    <munit:test name="saga-step3-duplicate-reply-warning-test" description="Verifies duplicate step 3 reply logs warning without advancing">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 3 COMPLETED']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 0 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step3UpdateResult" value="#[{ affectedRows: 0 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-3", "outcome": "SUCCESS", "result": { "shippingId": "SHIP-01" }, "completedAt": "2026-10-20T10:00:00Z" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="shipping-dispatch-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 3 COMPLETED']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 32. Step 3 Shipping Duplicate Failure (0 rows affected) -->
+    <munit:test name="saga-step3-duplicate-failure-warning-test" description="Verifies duplicate step 3 failure logs warning when 0 rows updated">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Check Step 3 Attempt']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step3Record" value="#[[{ attempt_count: 3 }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 3 FAILED']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 0 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="step3FailResult" value="#[{ affectedRows: 0 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-3", "outcome": "FAILURE", "failureCode": "CARRIER_ERROR", "failureMessage": "Dispatch failed", "retryable": false, "completedAt": "2026-10-20T10:00:00Z" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="shipping-dispatch-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 3 FAILED']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 33. Compensate Payment Subflow: Skip directly to inventory when payment not charged -->
+    <munit:test name="saga-compensate-payment-skip-charged-test" description="Verifies skipping refund when payment was never charged">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Find Charged Step 2']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="chargedPayment" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Find Reserved Step 1']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="reservedInventory" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Saga COMPENSATED Immediately']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="reply" value='#[output application/java --- { sagaId: "SAGA-01" }]' />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="saga-compensate-payment-subflow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Saga COMPENSATED Immediately']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 34. Payment Refund Reply: Duplicate Reply (0 rows affected) -->
+    <munit:test name="saga-payment-refund-reply-duplicate-test" description="Verifies duplicate refund reply logs warning">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 2 COMPENSATED']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 0 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="refundUpdateResult" value="#[{ affectedRows: 0 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-2", "outcome": "SUCCESS", "completedAt": "2026-10-20T10:00:00Z" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="payment-refund-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 2 COMPENSATED']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 35. Payment Refund Reply: Failure Routes to DLQ -->
+    <munit:test name="saga-payment-refund-reply-failure-dlq-test" description="Verifies failed refund reply routes message to dead-letter queue">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Saga COMPENSATION_FAILED']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Publish to saga.dead-letter.queue']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-2", "outcome": "FAILURE", "failureCode": "REFUND_GATEWAY_DOWN", "failureMessage": "Gateway timeout" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="payment-refund-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Publish to saga.dead-letter.queue']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 36. Compensate Inventory Subflow: Skip directly to COMPENSATED when inventory not reserved -->
+    <munit:test name="saga-compensate-inventory-skip-reserved-test" description="Verifies marking saga COMPENSATED immediately when inventory was never reserved">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Find Reserved Step 1']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="reservedInventory" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Saga COMPENSATED Immediately']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="activeSagaId" value="#['SAGA-01']" />
+                </munit:variables>
+            </munit:set-event>
+            <flow-ref name="saga-compensate-inventory-subflow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Saga COMPENSATED Immediately']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 37. Inventory Release Reply: Duplicate Reply (0 rows affected) -->
+    <munit:test name="saga-inventory-release-reply-duplicate-test" description="Verifies duplicate release reply logs warning">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 1 COMPENSATED']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 0 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="releaseUpdateResult" value="#[{ affectedRows: 0 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-1", "outcome": "SUCCESS", "completedAt": "2026-10-20T10:00:00Z" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="inventory-release-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step 1 COMPENSATED']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 38. Inventory Release Reply: Failure Routes to DLQ -->
+    <munit:test name="saga-inventory-release-reply-failure-dlq-test" description="Verifies failed release reply routes message to dead-letter queue">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Saga COMPENSATION_FAILED']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="amqp:publish">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Publish to saga.dead-letter.queue']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event>
+                <munit:payload value='{ "correlationId": "c1", "sagaId": "SAGA-01", "stepId": "SAGA-01-STEP-1", "outcome": "FAILURE", "failureCode": "INVENTORY_DOWN", "failureMessage": "Release failure" }' mediaType="application/json" />
+            </munit:set-event>
+            <flow-ref name="inventory-release-reply-listener-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="amqp:publish">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Publish to saga.dead-letter.queue']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 39. Saga Step Timeout Scanner: Step 1 Timeout -->
+    <munit:test name="saga-timeout-scanner-step1-timeout-test" description="Verifies timeout scanner marks step 1 FAILED and saga COMPENSATED immediately">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Find Timed-out Steps']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="timedOutSteps" value="#[[{ step_id: 'S-01', saga_id: 'SAGA-T1', step_sequence: 1, step_name: 'RESERVE_INVENTORY' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step FAILED']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stepTimeoutResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Saga COMPENSATING']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Saga COMPENSATED Immediately']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="saga-timeout-watchdog-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Saga COMPENSATED Immediately']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- 40. Saga Step Timeout Scanner: Step 3 Timeout -->
+    <munit:test name="saga-timeout-scanner-step3-timeout-test" description="Verifies timeout scanner compensates step 2 and step 1 for step 3 timeout">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Find Timed-out Steps']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="timedOutSteps" value="#[[{ step_id: 'S-03', saga_id: 'SAGA-T3', step_sequence: 3, step_name: 'DISPATCH_SHIPPING' }]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Step FAILED']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ affectedRows: 1 }]" />
+                    <munit-tools:variables>
+                        <munit-tools:variable key="stepTimeoutResult" value="#[{ affectedRows: 1 }]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Saga COMPENSATING']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Find Charged Step 2']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="chargedPayment" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:select">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Find Reserved Step 1']" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:variables>
+                        <munit-tools:variable key="reservedInventory" value="#[[]]" />
+                    </munit-tools:variables>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Saga COMPENSATED Immediately']" />
+                </munit-tools:with-attributes>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="saga-timeout-watchdog-flow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:verify-call processor="db:update">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="#['Mark Saga COMPENSATED Immediately']" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+</mule>
