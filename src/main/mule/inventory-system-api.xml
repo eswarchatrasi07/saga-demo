@@ -6,7 +6,8 @@
 	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
 	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
 	xmlns:http="http://www.mulesoft.org/schema/mule/http"
-	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+	xsi:schemaLocation="
 		http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
 		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
 		http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
@@ -14,32 +15,13 @@
 		http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
 		http://www.mulesoft.org/schema/mule/amqp http://www.mulesoft.org/schema/mule/amqp/current/mule-amqp.xsd">
 
-	<!-- ===================== GLOBAL CONFIGURATIONS ===================== -->
-	<configuration-properties doc:name="Configuration properties" file="config.yaml" />
-
-	<!-- HTTP Listener Config on port 8081 -->
-	<http:listener-config name="HTTP_Listener_config1" doc:name="HTTP Listener config">
-		<http:listener-connection host="0.0.0.0" port="8081" />
-	</http:listener-config>
-
-	<!-- APIKit Config -->
 	<apikit:config name="inventory-system-api-config"
 		api="inventory-system-api.raml"
 		outboundHeadersMapName="outboundHeaders"
 		httpStatusVarName="httpStatus" />
 
-	<!-- Database Config (Aiven Cloud MySQL) with Bounded Reconnection Strategy -->
-	<db:config name="Database_Config" doc:name="Database Config" doc:id="ede1b662-bb70-4f4d-8a07-b56a7c4c3b46" >
-		<db:my-sql-connection host="${db.host}" port="${db.port}" user="${db.user}" password="${db.password}" database="${database.inventory}">
-			<reconnection>
-				<reconnect count="3" frequency="2000" />
-			</reconnection>
-		</db:my-sql-connection>
-	</db:config>
-
-	<!-- ===================== MAIN ROUTER ===================== -->
 	<flow name="inventory-system-api-main">
-		<http:listener path="/api/*" config-ref="HTTP_Listener_config1">
+		<http:listener config-ref="Shared_HTTP_Listener_config" path="/inventory/api/*">
 			<http:response statusCode="#[vars.httpStatus default 200]">
 				<http:headers><![CDATA[#[vars.outboundHeaders default {}]]]></http:headers>
 			</http:response>
@@ -53,9 +35,8 @@
 		<error-handler ref="global-error-handler" />
 	</flow>
 
-	<!-- ===================== CONSOLE FLOW ===================== -->
 	<flow name="inventory-system-api-console">
-		<http:listener path="/console/*" config-ref="HTTP_Listener_config1">
+		<http:listener config-ref="Shared_HTTP_Listener_config" path="/inventory/console/*">
 			<http:response statusCode="#[vars.httpStatus default 200]">
 				<http:headers><![CDATA[#[vars.outboundHeaders default {}]]]></http:headers>
 			</http:response>
@@ -68,10 +49,9 @@
 		<error-handler ref="global-error-handler" />
 	</flow>
 
-	<!-- ===================== GET /stock/{sku} (HTTP) ===================== -->
 	<flow name="get:\stock\(sku):inventory-system-api-config">
 		<set-variable variableName="requestedSku" value="#[attributes.uriParams.sku]" doc:name="Save SKU" />
-		<db:select target="stockRows" doc:name="Read stock by SKU" config-ref="Database_Config">
+		<db:select target="stockRows" doc:name="Read stock by SKU" config-ref="inventory_Database_config">
 			<db:sql><![CDATA[SELECT * FROM product_inventory WHERE sku = :sku]]></db:sql>
 			<db:input-parameters><![CDATA[#[{sku: vars.requestedSku}]]]></db:input-parameters>
 		</db:select>
@@ -104,7 +84,6 @@ vars.stockRows[0]]]></ee:set-payload>
 		</choice>
 	</flow>
 
-	<!-- ===================== POST /reserve (HTTP REST) ===================== -->
 	<flow name="post:\reserve:application\json:inventory-system-api-config">
 		<set-variable variableName="request" value="#[output application/java
 var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
@@ -202,7 +181,6 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- ===================== POST /release (HTTP REST) ===================== -->
 	<flow name="post:\release:application\json:inventory-system-api-config">
 		<set-variable variableName="request" value="#[output application/java
 var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
@@ -289,12 +267,7 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- ===================================================================== -->
-	<!-- AMQP EVENT-DRIVEN FLOWS (Saga Orchestration)                          -->
-	<!-- ===================================================================== -->
-
-	<!-- 1. AMQP Listener: Reserve Inventory Command -->
-	<flow name="inventory-reserve-amqp-flow">
+	<flow name="inventory-reserve-amqp-flow" initialState="started">
 		<amqp:listener doc:name="Listen inventory.reserve.command"
 			config-ref="RabbitMQ_Config"
 			queueName="inventory.reserve.command"
@@ -388,16 +361,23 @@ payload]]></ee:set-payload>
 			</otherwise>
 		</choice>
 
-		<!-- Publish Success or Handled Business Failure Reply back to Saga Orchestrator -->
-		<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish inventory.reserve.reply">
-			<amqp:routing-keys>
-				<amqp:routing-key value="#[vars.request.replyTo default 'inventory.reserve.reply']" />
-			</amqp:routing-keys>
-			<amqp:message>
-				<amqp:body>#[payload]</amqp:body>
-				<amqp:properties correlationId="#[vars.request.correlationId default correlationId]" />
-			</amqp:message>
-		</amqp:publish>
+		<choice doc:name="Simulate Timeout?">
+		    <when expression="#[(vars.request.orderId default '') contains 'TIMEOUT']">
+		        <logger level="WARN" doc:name="Log Simulated Timeout" 
+		                message="#['[FAULT_INJECTION] Simulating worker timeout/silence for order: ' ++ (vars.request.orderId as String)]" />
+		    </when>
+		    <otherwise>
+		        <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish inventory.reserve.reply">
+		            <amqp:routing-keys>
+		                <amqp:routing-key value="#[vars.request.replyTo default 'inventory.reserve.reply']" />
+		            </amqp:routing-keys>
+		            <amqp:message>
+		                <amqp:body>#[payload]</amqp:body>
+		                <amqp:properties correlationId="#[vars.request.correlationId default correlationId]" />
+		            </amqp:message>
+		        </amqp:publish>
+		    </otherwise>
+		</choice>
 
 		<error-handler>
 			<on-error-continue type="ANY" logException="true">
@@ -423,7 +403,6 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- 2. AMQP Listener: Release Inventory Command (Compensation) -->
 	<flow name="inventory-release-amqp-flow">
 		<amqp:listener doc:name="Listen inventory.release.command"
 			config-ref="RabbitMQ_Config"
@@ -505,7 +484,6 @@ payload]]></ee:set-payload>
 			</otherwise>
 		</choice>
 
-		<!-- Publish Release Reply back to Saga Orchestrator -->
 		<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish inventory.release.reply">
 			<amqp:routing-keys>
 				<amqp:routing-key value="#[vars.request.replyTo default 'inventory.release.reply']" />
@@ -540,14 +518,13 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- ===================== LOCAL REUSABLE RACE-CONDITION SUB-FLOW ===================== -->
 	<sub-flow name="inventory-handle-duplicate-race-sub-flow">
 		<choice doc:name="Check if duplicate key race">
 			<when expression="#[
     contains((error.description default ''), 'Duplicate entry')
     or contains((error.description default ''), 'dedup_key')
 ]">
-				<db:select target="raceCheckResult" doc:name="Read winner response" config-ref="Database_Config">
+				<db:select target="raceCheckResult" doc:name="Read winner response" config-ref="inventory_Database_config">
 					<db:sql><![CDATA[SELECT result_payload FROM processed_commands WHERE dedup_key = :dedupKey]]></db:sql>
 					<db:input-parameters><![CDATA[#[{dedupKey: vars.dedupKey}]]]></db:input-parameters>
 				</db:select>
@@ -571,7 +548,7 @@ else 400]" doc:name="Set race status" />
   sagaId: vars.request.sagaId default vars.command.sagaId default null,
   stepId: vars.request.stepId default vars.command.stepId default null,
   stepName: vars.request.stepName default vars.command.stepName default 'RESERVE_INVENTORY',
-  attempt: vars.request.attempt default vars.command.attempt default 1,
+  attempt: vars.request.attempt default 1,
   outcome: 'FAILURE',
   completedAt: now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;},
   failureType: 'BUSINESS',
@@ -591,22 +568,33 @@ payload]]></ee:set-payload>
 				</ee:transform>
 			</when>
 			<otherwise>
-				<!-- Delegate all other errors to centralized global subflow -->
 				<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Invoke Global Error Sub-Flow" />
 			</otherwise>
 		</choice>
 	</sub-flow>
 
-	<!-- ===================== RESERVE SUB-FLOW ===================== -->
 	<sub-flow name="inventory-reserver-Sub_Flow">
 		<choice doc:name="Validate reserve command">
-			<when expression="#[isEmpty(vars.command.correlationId default '') or&#10;    isEmpty(vars.command.sagaId default '') or&#10;    isEmpty(vars.command.stepId default '') or&#10;    isEmpty(vars.command.payload.orderId default '') or&#10;    (vars.command.commandType default '') != 'RESERVE' or&#10;    not (vars.command.payload.items is Array) or&#10;    isEmpty(vars.command.payload.items default [])]">
+			<when expression="#[isEmpty(vars.command.correlationId default '') or
+    isEmpty(vars.command.sagaId default '') or
+    isEmpty(vars.command.stepId default '') or
+    isEmpty(vars.command.payload.orderId default '') or
+    (vars.command.commandType default '') != 'RESERVE' or
+    not (vars.command.payload.items is Array) or
+    isEmpty(vars.command.payload.items default [])]">
 				<raise-error type="INVENTORY:INVALID_COMMAND" description="Reserve command requires correlationId, sagaId, stepId, commandType RESERVE, orderId and a non-empty items array" />
 			</when>
 		</choice>
 
 		<choice doc:name="Validate reserve items">
-			<when expression="#[!isEmpty(&#10; vars.command.payload.items filter ((item) -&gt;&#10;if (not (item is Object)) true&#10;else if (isEmpty(item.sku default '')) true&#10;else if (not (item.quantity is Number)) true&#10;else (item.quantity &lt;= 0) or floor(item.quantity) != item.quantity&#10;        )&#10;    )]">
+			<when expression="#[!isEmpty(
+ vars.command.payload.items filter ((item) -&gt;
+if (not (item is Object)) true
+else if (isEmpty(item.sku default '')) true
+else if (not (item.quantity is Number)) true
+else (item.quantity &lt;= 0) or floor(item.quantity) != item.quantity
+        )
+    )]">
 				<raise-error type="INVENTORY:INVALID_ITEM" description="Each item must contain a SKU and a positive whole-number quantity" />
 			</when>
 		</choice>
@@ -626,7 +614,7 @@ vars.command.payload.items
 		<set-variable variableName="inventoryReply" value="#[null]" doc:name="Init inventoryReply" />
 
 		<try doc:name="Inventory reservation transaction" transactionalAction="ALWAYS_BEGIN" transactionType="LOCAL">
-			<db:select target="existingReserveCommand" doc:name="Check previously processed command" config-ref="Database_Config">
+			<db:select target="existingReserveCommand" doc:name="Check previously processed command" config-ref="inventory_Database_config">
 				<db:sql><![CDATA[SELECT dedup_key, result_payload FROM processed_commands WHERE dedup_key = :dedupKey FOR UPDATE]]></db:sql>
 				<db:input-parameters><![CDATA[#[{dedupKey: vars.dedupKey}]]]></db:input-parameters>
 			</db:select>
@@ -648,7 +636,7 @@ else
 				<otherwise>
 					<foreach collection="#[vars.reserveItems]" doc:name="Check all requested stock">
 						<set-variable variableName="currentItem" value="#[payload]" doc:name="Set currentItem" />
-						<db:select target="stockRows" doc:name="Lock product stock row" config-ref="Database_Config">
+						<db:select target="stockRows" doc:name="Lock product stock row" config-ref="inventory_Database_config">
 							<db:sql><![CDATA[SELECT sku, available_quantity FROM product_inventory WHERE sku = :sku FOR UPDATE]]></db:sql>
 							<db:input-parameters><![CDATA[#[{sku: vars.currentItem.sku}]]]></db:input-parameters>
 						</db:select>
@@ -707,7 +695,7 @@ else
 								<set-variable variableName="currentItem" value="#[payload]" doc:name="Set currentItem" />
 								<set-variable variableName="reservationId" value="#['RSV-' ++ (uuid() as String)]" doc:name="Generate reservationId" />
 								<set-variable variableName="expiresAt" value="#[(now() + |PT15M|) as String {format: &quot;yyyy-MM-dd'T'HH:mm:ssXXX&quot;}]" doc:name="Set expiresAt" />
-								<db:update target="stockUpdateResult" doc:name="Decrease available stock" config-ref="Database_Config">
+								<db:update target="stockUpdateResult" doc:name="Decrease available stock" config-ref="inventory_Database_config">
 									<db:sql><![CDATA[UPDATE product_inventory
 SET available_quantity = available_quantity - :quantity,
     reserved_quantity = reserved_quantity + :quantity
@@ -720,7 +708,7 @@ WHERE sku = :sku
 										<raise-error type="INVENTORY:INSUFFICIENT_QUANTITY" description="Stock changed before the reservation could be completed" />
 									</when>
 								</choice>
-								<db:insert doc:name="Insert reservation" config-ref="Database_Config">
+								<db:insert doc:name="Insert reservation" config-ref="inventory_Database_config">
 									<db:sql><![CDATA[INSERT INTO inventory_reservations (reservation_id, order_id, sku, quantity, status, expires_at) VALUES (:reservationId, :orderId, :sku, :quantity, 'RESERVED', :expiresAt)]]></db:sql>
 									<db:input-parameters><![CDATA[#[{reservationId: vars.reservationId, orderId: vars.command.payload.orderId, sku: vars.currentItem.sku, quantity: vars.currentItem.quantity, expiresAt: vars.expiresAt}]]]></db:input-parameters>
 								</db:insert>
@@ -754,7 +742,7 @@ WHERE sku = :sku
 						</otherwise>
 					</choice>
 
-					<db:insert doc:name="Save idempotent command response" config-ref="Database_Config">
+					<db:insert doc:name="Save idempotent command response" config-ref="inventory_Database_config">
 						<db:sql><![CDATA[INSERT INTO processed_commands (dedup_key, step_id, command_type, result_payload, processed_at) VALUES (:dedupKey, :stepId, 'RESERVE', :resultPayload, CURRENT_TIMESTAMP)]]></db:sql>
 						<db:input-parameters><![CDATA[#[{dedupKey: vars.dedupKey, stepId: vars.command.stepId, resultPayload: write(vars.inventoryReply, 'application/json')}]]]></db:input-parameters>
 					</db:insert>
@@ -765,7 +753,6 @@ WHERE sku = :sku
 		<set-payload value="#[vars.inventoryReply]" doc:name="Return inventory reservation reply" />
 	</sub-flow>
 
-	<!-- ===================== RELEASE SUB-FLOW (compensation) ===================== -->
 	<sub-flow name="inventory-release-Sub_Flow">
 		<choice doc:name="Validate release command">
 			<when expression="#[
@@ -782,7 +769,7 @@ WHERE sku = :sku
 		<set-variable variableName="inventoryReply" value="#[null]" doc:name="Init inventoryReply" />
 
 		<try doc:name="Inventory release transaction" transactionalAction="ALWAYS_BEGIN" transactionType="LOCAL">
-			<db:select target="existingReleaseCommand" doc:name="Check previously processed command" config-ref="Database_Config">
+			<db:select target="existingReleaseCommand" doc:name="Check previously processed command" config-ref="inventory_Database_config">
 				<db:sql><![CDATA[SELECT dedup_key, result_payload FROM processed_commands WHERE dedup_key = :dedupKey FOR UPDATE]]></db:sql>
 				<db:input-parameters><![CDATA[#[{dedupKey: vars.dedupKey}]]]></db:input-parameters>
 			</db:select>
@@ -806,7 +793,7 @@ else
 				<otherwise>
 					<choice doc:name="Resolve reservations to release">
 						<when expression="#[isEmpty(vars.command.payload.reservationIds default [])]">
-							<db:select target="orderReservations" doc:name="Find reservations by order" config-ref="Database_Config">
+							<db:select target="orderReservations" doc:name="Find reservations by order" config-ref="inventory_Database_config">
 								<db:sql><![CDATA[SELECT reservation_id FROM inventory_reservations WHERE order_id = :orderId FOR UPDATE]]></db:sql>
 								<db:input-parameters><![CDATA[#[{orderId: vars.command.payload.orderId}]]]></db:input-parameters>
 							</db:select>
@@ -828,7 +815,7 @@ else
 					<foreach collection="#[vars.releaseIds]" doc:name="Release each reservation">
 						<set-variable variableName="currentReservationId" value="#[payload as String]" doc:name="Set currentReservationId" />
 
-						<db:select target="reservationRows" doc:name="Lock reservation row" config-ref="Database_Config">
+						<db:select target="reservationRows" doc:name="Lock reservation row" config-ref="inventory_Database_config">
 							<db:sql><![CDATA[SELECT reservation_id, order_id, sku, quantity, status FROM inventory_reservations WHERE reservation_id = :reservationId FOR UPDATE]]></db:sql>
 							<db:input-parameters><![CDATA[#[{reservationId: vars.currentReservationId}]]]></db:input-parameters>
 						</db:select>
@@ -839,18 +826,17 @@ else
 							</when>
 
 							<when expression="#[vars.reservationRows[0].status == 'RESERVED']">
-								<db:update target="stockRestoreResult" doc:name="Restore available stock" config-ref="Database_Config">
-									<db:sql><![CDATA[UPDATE product_inventory
-SET available_quantity = available_quantity + :quantity,
-    reserved_quantity = reserved_quantity - :quantity,
-    updated_at = CURRENT_TIMESTAMP
-WHERE sku = :sku
-  AND reserved_quantity >= :quantity]]></db:sql>
-									<db:input-parameters><![CDATA[#[{
-	sku: vars.reservationRows[0].sku,
-	quantity: vars.reservationRows[0].quantity
-}]]]></db:input-parameters>
-								</db:update>
+								<db:update target="stockRestoreResult" doc:name="Restore available stock" config-ref="inventory_Database_config">
+			    <db:sql><![CDATA[UPDATE product_inventory
+			SET available_quantity = available_quantity + :quantity,
+			    reserved_quantity = reserved_quantity - :quantity
+			WHERE sku = :sku
+			  AND reserved_quantity >= :quantity]]></db:sql>
+			    <db:input-parameters><![CDATA[#[{
+			        sku: vars.reservationRows[0].sku,
+			        quantity: vars.reservationRows[0].quantity
+			    }]]]></db:input-parameters>
+			</db:update>
 
 								<choice doc:name="Ensure stock restored">
 									<when expression="#[((if (vars.stockRestoreResult is Number) vars.stockRestoreResult else vars.stockRestoreResult.affectedRows) default 0) &lt;= 0]">
@@ -858,17 +844,16 @@ WHERE sku = :sku
 									</when>
 								</choice>
 
-								<db:update target="reservationUpdateResult" doc:name="Mark reservation released" config-ref="Database_Config">
-									<db:sql><![CDATA[UPDATE inventory_reservations
-SET status = 'RELEASED',
-    released_at = CURRENT_TIMESTAMP
-WHERE reservation_id = :reservationId
-  AND status = 'RESERVED']]></db:sql>
-									<db:input-parameters><![CDATA[#[{reservationId: vars.currentReservationId}]]]></db:input-parameters>
+								<db:update doc:name="Mark reservation released" config-ref="inventory_Database_config">
+								    <db:sql><![CDATA[UPDATE inventory_reservations
+								SET status = 'RELEASED',
+								    released_at = CURRENT_TIMESTAMP
+								WHERE reservation_id = :reservationId]]></db:sql>
+								    <db:input-parameters><![CDATA[#[{reservationId: vars.reservationRows[0].reservation_id default vars.currentReservationId}]]]></db:input-parameters>
 								</db:update>
 
 								<choice doc:name="Ensure reservation marked released">
-									<when expression="#[((if (vars.reservationUpdateResult is Number) vars.reservationUpdateResult else vars.reservationUpdateResult.affectedRows) default 0) &lt;= 0]">
+									<when expression="#[((if (vars.reservationUpdateResult is Number) vars.reservationUpdateResult else vars.reservationUpdateResult.affectedRows) default 0) &gt; 0]">
 										<raise-error type="INVENTORY:RESERVATION_UPDATE_FAILED" description="#['Failed to mark reservation as RELEASED for ID: ' ++ vars.currentReservationId]" />
 									</when>
 								</choice>
@@ -908,7 +893,7 @@ WHERE reservation_id = :reservationId
     )
 }]" doc:name="Build release reply" />
 
-					<db:insert doc:name="Save idempotent command response" config-ref="Database_Config">
+					<db:insert doc:name="Save idempotent command response" config-ref="inventory_Database_config">
 						<db:sql><![CDATA[INSERT INTO processed_commands (dedup_key, step_id, command_type, result_payload, processed_at)
 VALUES (:dedupKey, :stepId, 'RELEASE', :resultPayload, CURRENT_TIMESTAMP)]]></db:sql>
 						<db:input-parameters><![CDATA[#[{

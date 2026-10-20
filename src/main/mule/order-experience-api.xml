@@ -11,37 +11,14 @@
         http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
         http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
 
-    <!-- ================================================================= -->
-    <!-- GLOBAL CONFIGURATIONS: EXPERIENCE API LAYER                      -->
-    <!-- ================================================================= -->
-
-    <!-- HTTP Listener on Port 8085 -->
-    <http:listener-config name="Order_Experience_HTTP_Listener_config" doc:name="HTTP Listener config">
-        <http:listener-connection host="0.0.0.0" port="${experience.http.port}" />
-    </http:listener-config>
-
-    <!-- APIKit Router for Experience API RAML -->
     <apikit:config name="order-experience-api-config" 
                    api="api/order-experience-api.raml" 
                    outboundHeadersMapName="outboundHeaders" 
                    httpStatusVarName="httpStatus" 
                    doc:name="APIKit Config" />
 
-    <!-- HTTP Request Config Targeting Saga Process API (Port 8084) -->
-    <http:request-config name="Saga_Process_API_Request_config" 
-                         basePath="${process.basePath}" 
-                         responseTimeout="60000" 
-                         doc:name="HTTP Request configuration">
-        <http:request-connection host="${process.host}" 
-                                port="${process.port}" 
-                                connectionIdleTimeout="60000" />
-    </http:request-config>
-
-    <!-- ================================================================= -->
-    <!-- MAIN EXPERIENCE API ROUTER FLOW                                  -->
-    <!-- ================================================================= -->
     <flow name="order-experience-api-main">
-        <http:listener config-ref="Order_Experience_HTTP_Listener_config" path="/api/v1/*" doc:name="Listener (Port 8085)">
+        <http:listener config-ref="Shared_HTTP_Listener_config" path="/api/v1/*" doc:name="Listener (Port 8081)">
             <http:response statusCode="#[vars.httpStatus default 200]">
                 <http:headers>#[vars.outboundHeaders default {}]</http:headers>
             </http:response>
@@ -54,9 +31,8 @@
         <error-handler ref="global-error-handler" />
     </flow>
 
-    <!-- API Console Flow for Testing & Documentation -->
     <flow name="order-experience-api-console">
-        <http:listener config-ref="Order_Experience_HTTP_Listener_config" path="/console/*" doc:name="Console Listener">
+        <http:listener config-ref="Shared_HTTP_Listener_config" path="/console/*" doc:name="Console Listener">
             <http:response statusCode="#[vars.httpStatus default 200]">
                 <http:headers>#[vars.outboundHeaders default {}]</http:headers>
             </http:response>
@@ -69,137 +45,27 @@
         <error-handler ref="global-error-handler" />
     </flow>
 
-    <!-- ================================================================= -->
-    <!-- ENDPOINT 1: POST /api/v1/sagas/order-fulfilment                   -->
-    <!-- Validates client order & forwards to Saga Process API             -->
-    <!-- ================================================================= -->
     <flow name="post:\sagas\order-fulfilment:application\json:order-experience-api-config">
-        <!-- 1. Capture and resolve Correlation Identifier -->
         <set-variable variableName="corrId" 
                       value="#[attributes.headers['x-correlation-id'] default attributes.headers['correlationid'] default correlationId default uuid()]" 
                       doc:name="Resolve Correlation ID" />
-        <set-variable variableName="clientReq" 
+        <set-variable variableName="inboundReq" 
                       value="#[payload]" 
                       doc:name="Save Incoming Order Payload" />
 
-        <!-- 2. Secure Logging: Log business identifiers without leaking payment tokens -->
         <logger level="INFO" 
                 doc:name="Log Experience Inbound Request" 
-                message="#[output text/plain --- '[EXP-API] Inbound order-fulfilment request received for orderId: ' ++ (vars.clientReq.orderId default 'UNKNOWN' as String) ++ ' | customerId: ' ++ (vars.clientReq.customerId default 'UNKNOWN' as String) ++ ' | totalAmount: ' ++ (vars.clientReq.totalAmount default 0 as String) ++ ' | correlationId: ' ++ (vars.corrId default '' as String)]" />
+                message="#[output text/plain --- '[EXP-API] Inbound order-fulfilment received: orderId=' ++ (vars.inboundReq.orderId default 'UNKNOWN' as String) ++ ' | correlationId=' ++ (vars.corrId default '' as String)]" />
 
-        <!-- 3. Forward to Saga Process API using HTTP Request Connector -->
-        <try doc:name="Forward Request to Process API">
-            <http:request method="POST" 
-                          config-ref="Saga_Process_API_Request_config" 
-                          path="/sagas/order-fulfilment" 
-                          sendCorrelationId="ALWAYS" 
-                          correlationId="#[vars.corrId]" 
-                          responseTimeout="60000" 
-                          doc:name="Forward to Saga Process API (Port 8084)">
-                <http:body>#[vars.clientReq]</http:body>
-                <http:headers><![CDATA[#[{
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "X-Correlation-ID": vars.corrId
-                }]]]></http:headers>
-                <http:response-validator>
-                    <!-- Allow all downstream status codes (200, 202, 400, 404, 409, 500) to pass through intact -->
-                    <http:success-status-code-validator values="0..599"/>
-                </http:response-validator>
-            </http:request>
+        <flow-ref name="saga-process-order-fulfilment" doc:name="Invoke Saga Orchestrator" />
 
-            <!-- 4. Preserve Downstream Process API HTTP Status Code & Headers -->
-            <set-variable variableName="httpStatus" 
-                          value="#[attributes.statusCode default 200]" 
-                          doc:name="Preserve Process API Status Code" />
-            <set-variable variableName="outboundHeaders" 
-                          value="#[output application/java --- { 'X-Correlation-ID': vars.corrId }]" 
-                          doc:name="Set Outbound Correlation Header" />
-
-            <logger level="INFO" 
-                    doc:name="Log Downstream Response Outcome" 
-                    message="#[output text/plain --- '[EXP-API] Process API response for orderId: ' ++ (vars.clientReq.orderId default '' as String) ++ ' | HTTP Status: ' ++ (attributes.statusCode default '' as String) ++ ' | correlationId: ' ++ (vars.corrId default '' as String)]" />
-
-            <!-- Error Handling for Network & Downstream Service Failures -->
-            <error-handler>
-                <!-- 502 Bad Gateway: Connection Refused or Process API Offline -->
-                <on-error-continue type="HTTP:CONNECTIVITY" logException="true" doc:name="502 Bad Gateway">
-                    <set-variable variableName="httpStatus" value="502" doc:name="Set Status 502" />
-                    <logger level="ERROR" 
-                            doc:name="Log 502 Connectivity Failure" 
-                            message="#[output text/plain --- '[EXP-API] Connection refused: Saga Process API is down on port ' ++ ('${process.port}' as String) ++ ' | correlationId: ' ++ (vars.corrId default '' as String)]" />
-                    <ee:transform doc:name="Build 502 Error Payload">
-                        <ee:message>
-                            <ee:set-payload><![CDATA[%dw 2.0
-output application/json
----
-{
-    errorCode: "BAD_GATEWAY",
-    message: "Saga Process API is unavailable or connection refused",
-    targetService: "Saga Process API (Port " ++ ("${process.port}" as String) ++ ")",
-    orderId: vars.clientReq.orderId,
-    correlationId: vars.corrId,
-    timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"}
-}]]></ee:set-payload>
-                        </ee:message>
-                    </ee:transform>
-                </on-error-continue>
-
-                <!-- 504 Gateway Timeout: Process API Socket / Read Timeout -->
-                <on-error-continue type="HTTP:TIMEOUT" logException="true" doc:name="504 Gateway Timeout">
-                    <set-variable variableName="httpStatus" value="504" doc:name="Set Status 504" />
-                    <logger level="ERROR" 
-                            doc:name="Log 504 Timeout Failure" 
-                            message="#[output text/plain --- '[EXP-API] Gateway timeout: Saga Process API did not respond within timeout threshold | correlationId: ' ++ (vars.corrId default '' as String)]" />
-                    <ee:transform doc:name="Build 504 Error Payload">
-                        <ee:message>
-                            <ee:set-payload><![CDATA[%dw 2.0
-output application/json
----
-{
-    errorCode: "GATEWAY_TIMEOUT",
-    message: "Saga Process API timed out waiting for response",
-    targetService: "Saga Process API",
-    orderId: vars.clientReq.orderId,
-    correlationId: vars.corrId,
-    timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"}
-}]]></ee:set-payload>
-                        </ee:message>
-                    </ee:transform>
-                </on-error-continue>
-
-                <!-- 500 Internal Error: Unexpected forwarding failure -->
-                <on-error-continue type="ANY" logException="true" doc:name="500 Internal Error">
-                    <set-variable variableName="httpStatus" value="500" doc:name="Set Status 500" />
-                    <logger level="ERROR" 
-                            doc:name="Log 500 Unexpected Failure" 
-                            message="#[output text/plain --- '[EXP-API] Unexpected error in Experience API forwarding: ' ++ (error.description default '' as String) ++ ' | correlationId: ' ++ (vars.corrId default '' as String)]" />
-                    <ee:transform doc:name="Build 500 Error Payload">
-                        <ee:message>
-                            <ee:set-payload><![CDATA[%dw 2.0
-output application/json
----
-{
-    errorCode: "INTERNAL_ERROR",
-    message: "An unexpected error occurred while communicating with the Saga Process API",
-    orderId: vars.clientReq.orderId,
-    correlationId: vars.corrId,
-    timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"}
-}]]></ee:set-payload>
-                        </ee:message>
-                    </ee:transform>
-                </on-error-continue>
-            </error-handler>
-        </try>
+        <set-variable variableName="outboundHeaders" 
+                      value="#[output application/java --- { 'X-Correlation-ID': vars.corrId }]" 
+                      doc:name="Set Outbound Correlation Header" />
     </flow>
 
-    <!-- ================================================================= -->
-    <!-- ENDPOINT 2: GET /api/v1/sagas/{sagaId}                            -->
-    <!-- Retrieves Saga Status by forwarding to Saga Process API           -->
-    <!-- ================================================================= -->
     <flow name="get:\sagas\(sagaId):order-experience-api-config">
-        <!-- 1. Extract URI Parameter and Correlation Identifier -->
-        <set-variable variableName="sagaId" 
+        <set-variable variableName="lookupSagaId" 
                       value="#[attributes.uriParams.sagaId]" 
                       doc:name="Extract sagaId from URI" />
         <set-variable variableName="corrId" 
@@ -208,102 +74,13 @@ output application/json
 
         <logger level="INFO" 
                 doc:name="Log Experience Status Query" 
-                message="#[output text/plain --- '[EXP-API] Inbound saga status query for sagaId: ' ++ (vars.sagaId default '' as String) ++ ' | correlationId: ' ++ (vars.corrId default '' as String)]" />
+                message="#[output text/plain --- '[EXP-API] Saga query for sagaId=' ++ (vars.lookupSagaId default '' as String) ++ ' | correlationId=' ++ (vars.corrId default '' as String)]" />
 
-        <!-- 2. Forward Query to Saga Process API -->
-        <try doc:name="Query Status from Process API">
-            <http:request method="GET" 
-                          config-ref="Saga_Process_API_Request_config" 
-                          path="/sagas/{sagaId}" 
-                          sendCorrelationId="ALWAYS" 
-                          correlationId="#[vars.corrId]" 
-                          responseTimeout="30000" 
-                          doc:name="GET /sagas/{sagaId} (Port 8084)">
-                <http:headers><![CDATA[#[{
-                    "Accept": "application/json",
-                    "X-Correlation-ID": vars.corrId
-                }]]]></http:headers>
-                <http:uri-params><![CDATA[#[{ "sagaId": vars.sagaId }]]]></http:uri-params>
-                <http:response-validator>
-                    <!-- Preserve Process API status codes (200, 404, 500) -->
-                    <http:success-status-code-validator values="0..599"/>
-                </http:response-validator>
-            </http:request>
+        <flow-ref name="saga-process-get-status" doc:name="Query Saga Status" />
 
-            <!-- 3. Preserve Downstream Process API HTTP Status Code & Headers -->
-            <set-variable variableName="httpStatus" 
-                          value="#[attributes.statusCode default 200]" 
-                          doc:name="Preserve Process API Status Code" />
-            <set-variable variableName="outboundHeaders" 
-                          value="#[output application/java --- { 'X-Correlation-ID': vars.corrId }]" 
-                          doc:name="Set Outbound Correlation Header" />
-
-            <logger level="INFO" 
-                    doc:name="Log Status Response Outcome" 
-                    message="#[output text/plain --- '[EXP-API] Process API status query for sagaId: ' ++ (vars.sagaId default '' as String) ++ ' | HTTP Status: ' ++ (attributes.statusCode default '' as String) ++ ' | correlationId: ' ++ (vars.corrId default '' as String)]" />
-
-            <!-- Error Handling for Status Query -->
-            <error-handler>
-                <!-- 502 Bad Gateway -->
-                <on-error-continue type="HTTP:CONNECTIVITY" logException="true" doc:name="502 Bad Gateway">
-                    <set-variable variableName="httpStatus" value="502" doc:name="Set Status 502" />
-                    <ee:transform doc:name="Build 502 Error Payload">
-                        <ee:message>
-                            <ee:set-payload><![CDATA[%dw 2.0
-output application/json
----
-{
-    errorCode: "BAD_GATEWAY",
-    message: "Saga Process API is unavailable or connection refused",
-    targetService: "Saga Process API (Port " ++ ("${process.port}" as String) ++ ")",
-    sagaId: vars.sagaId,
-    correlationId: vars.corrId,
-    timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"}
-}]]></ee:set-payload>
-                        </ee:message>
-                    </ee:transform>
-                </on-error-continue>
-
-                <!-- 504 Gateway Timeout -->
-                <on-error-continue type="HTTP:TIMEOUT" logException="true" doc:name="504 Gateway Timeout">
-                    <set-variable variableName="httpStatus" value="504" doc:name="Set Status 504" />
-                    <ee:transform doc:name="Build 504 Error Payload">
-                        <ee:message>
-                            <ee:set-payload><![CDATA[%dw 2.0
-output application/json
----
-{
-    errorCode: "GATEWAY_TIMEOUT",
-    message: "Saga Process API timed out waiting for status response",
-    targetService: "Saga Process API",
-    sagaId: vars.sagaId,
-    correlationId: vars.corrId,
-    timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"}
-}]]></ee:set-payload>
-                        </ee:message>
-                    </ee:transform>
-                </on-error-continue>
-
-                <!-- 500 Internal Error -->
-                <on-error-continue type="ANY" logException="true" doc:name="500 Internal Error">
-                    <set-variable variableName="httpStatus" value="500" doc:name="Set Status 500" />
-                    <ee:transform doc:name="Build 500 Error Payload">
-                        <ee:message>
-                            <ee:set-payload><![CDATA[%dw 2.0
-output application/json
----
-{
-    errorCode: "INTERNAL_ERROR",
-    message: "An unexpected error occurred while retrieving saga status",
-    sagaId: vars.sagaId,
-    correlationId: vars.corrId,
-    timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssXXX"}
-}]]></ee:set-payload>
-                        </ee:message>
-                    </ee:transform>
-                </on-error-continue>
-            </error-handler>
-        </try>
+        <set-variable variableName="outboundHeaders" 
+                      value="#[output application/java --- { 'X-Correlation-ID': vars.corrId }]" 
+                      doc:name="Set Outbound Correlation Header" />
     </flow>
 
 </mule>

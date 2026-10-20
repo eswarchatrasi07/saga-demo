@@ -15,33 +15,13 @@
 		http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
 		http://www.mulesoft.org/schema/mule/amqp http://www.mulesoft.org/schema/mule/amqp/current/mule-amqp.xsd">
 
-	<!-- ==================== GLOBAL CONFIGURATIONS ==================== -->
-	<!-- 1. Properties file loaded first -->
-	<configuration-properties doc:name="Configuration properties" file="config.yaml" />
-
-	<!-- 2. HTTP Listener Config on Port 8082 -->
-	<http:listener-config name="payment-system-api-httpListenerConfig">
-		<http:listener-connection host="0.0.0.0" port="8082" />
-	</http:listener-config>
-
-	<!-- 3. APIKit Router Config -->
 	<apikit:config name="payment-system-api-config"
-			api="payment-system.raml"
+		api="payment-system.raml"
 		outboundHeadersMapName="outboundHeaders"
 		httpStatusVarName="httpStatus" />
 
-	<!-- 4. Database Config (Aiven MySQL) with Bounded Reconnection -->
-	<db:config name="payment_Database_Config1" doc:name="Database Config" doc:id="4e2413c5-13ed-4779-8fb3-3e899f46db7f">
-		<db:my-sql-connection host="${db.host}" port="${db.port}" user="${db.user}" password="${db.password}" database="${database.payment}">
-			<reconnection>
-				<reconnect count="3" frequency="2000" />
-			</reconnection>
-		</db:my-sql-connection>
-	</db:config>
-
-	<!-- ==================== MAIN ROUTER FLOW ==================== -->
 	<flow name="payment-system-api-main">
-		<http:listener config-ref="payment-system-api-httpListenerConfig" path="/api/v1/*">
+		<http:listener config-ref="Shared_HTTP_Listener_config" path="/payment/api/v1/*">
 			<http:response statusCode="#[vars.httpStatus default 200]">
 				<http:headers>#[vars.outboundHeaders default {}]</http:headers>
 			</http:response>
@@ -55,7 +35,6 @@
 		<error-handler ref="global-error-handler" />
 	</flow>
 
-	<!-- ==================== POST /payments/charge (HTTP REST) ==================== -->
 	<flow name="post:\payments\charge:application\json:payment-system-api-config">
 		<set-variable variableName="request" value="#[output application/java
 var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
@@ -72,7 +51,12 @@ raw ++ {
 }]" doc:name="Save charge request" />
 
 		<choice doc:name="Validate Charge Payload">
-			<when expression="#[isEmpty(vars.request.correlationId default '') or&#10;				isEmpty(vars.request.sagaId default '') or&#10;				isEmpty(vars.request.stepId default '') or&#10;				isEmpty(vars.request.orderId default '') or&#10;				isEmpty(vars.request.cardToken default '') or&#10;				(vars.request.amount == null or not (vars.request.amount is Number) or vars.request.amount &lt;= 0)]">
+			<when expression="#[isEmpty(vars.request.correlationId default '') or
+				isEmpty(vars.request.sagaId default '') or
+				isEmpty(vars.request.stepId default '') or
+				isEmpty(vars.request.orderId default '') or
+				isEmpty(vars.request.cardToken default '') or
+				(vars.request.amount == null or not (vars.request.amount is Number) or vars.request.amount &lt;= 0)]">
 				<set-variable variableName="httpStatus" value="400" doc:name="Status 400" />
 				<set-payload value="#[output application/java ---
 {
@@ -109,7 +93,10 @@ raw ++ {
 
 				<flow-ref doc:name="Invoke Charge Sub-Flow" name="payment-charge-Sub_Flow" />
 
-				<set-variable variableName="httpStatus" value="#[if (payload.outcome == 'SUCCESS') 200&#10;					else if (payload.failureCode == 'PAYMENT_DECLINED' or payload.failureCode == 'COMMAND_IN_PROGRESS') 409&#10;					else if (payload.retryable default false) 503&#10;					else 400]" doc:name="Set httpStatus" />
+				<set-variable variableName="httpStatus" value="#[if (payload.outcome == 'SUCCESS') 200
+					else if (payload.failureCode == 'PAYMENT_DECLINED' or payload.failureCode == 'COMMAND_IN_PROGRESS') 409
+					else if (payload.retryable default false) 503
+					else 400]" doc:name="Set httpStatus" />
 			</otherwise>
 		</choice>
 
@@ -129,7 +116,6 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- ==================== POST /payments/refund (HTTP REST) ==================== -->
 	<flow name="post:\payments\refund:application\json:payment-system-api-config">
 		<set-variable variableName="request" value="#[output application/java
 var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
@@ -184,7 +170,11 @@ raw ++ {
 
 				<flow-ref doc:name="Invoke Refund Sub-Flow" name="payment-refund-Sub_Flow" />
 
-				<set-variable variableName="httpStatus" value="#[if (payload.outcome == 'SUCCESS') 200&#10;					else if (payload.failureCode == 'PAYMENT_NOT_FOUND') 404&#10;					else if (payload.failureCode == 'INVALID_PAYMENT_STATE' or payload.failureCode == 'COMMAND_IN_PROGRESS') 409&#10;					else if (payload.retryable default false) 503&#10;					else 400]" doc:name="Set status from reply" />
+				<set-variable variableName="httpStatus" value="#[if (payload.outcome == 'SUCCESS') 200
+					else if (payload.failureCode == 'PAYMENT_NOT_FOUND') 404
+					else if (payload.failureCode == 'INVALID_PAYMENT_STATE' or payload.failureCode == 'COMMAND_IN_PROGRESS') 409
+					else if (payload.retryable default false) 503
+					else 400]" doc:name="Set status from reply" />
 			</otherwise>
 		</choice>
 
@@ -204,11 +194,6 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- ===================================================================== -->
-	<!-- AMQP EVENT-DRIVEN FLOWS (Saga Orchestration)                          -->
-	<!-- ===================================================================== -->
-
-	<!-- 1. AMQP Listener: Charge Payment Command (Saga Step 2) -->
 	<flow name="payment-charge-amqp-flow">
 		<amqp:listener doc:name="Listen payment.charge.command"
 			config-ref="RabbitMQ_Config"
@@ -234,7 +219,15 @@ raw ++ {
 }]" doc:name="Save charge request" />
 
 		<choice doc:name="Validate Charge Payload">
-			<when expression="#[isEmpty(vars.request.correlationId default '') or&#10;isEmpty(vars.request.sagaId default '') or&#10;isEmpty(vars.request.stepId default '') or&#10;isEmpty(vars.request.orderId default '') or&#10;isEmpty(vars.request.cardToken default '') or&#10;(vars.request.amount == null or&#10;	not (vars.request.amount is Number) or&#10;	 vars.request.amount &lt;= 0&#10;)]">
+			<when expression="#[isEmpty(vars.request.correlationId default '') or
+isEmpty(vars.request.sagaId default '') or
+isEmpty(vars.request.stepId default '') or
+isEmpty(vars.request.orderId default '') or
+isEmpty(vars.request.cardToken default '') or
+(vars.request.amount == null or
+	not (vars.request.amount is Number) or
+	 vars.request.amount &lt;= 0
+)]">
 				<set-payload value="#[output application/json ---
 {
 	correlationId: vars.request.correlationId default null,
@@ -281,7 +274,6 @@ payload]]></ee:set-payload>
 			</otherwise>
 		</choice>
 
-		<!-- Publish Reply back to Saga Orchestrator -->
 		<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish payment.charge.reply">
 			<amqp:routing-keys>
 				<amqp:routing-key value="#[vars.request.replyTo default 'payment.charge.reply']" />
@@ -316,7 +308,6 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- 2. AMQP Listener: Refund Payment Command (Saga Compensation Step 2) -->
 	<flow name="payment-refund-amqp-flow">
 		<amqp:listener doc:name="Listen payment.refund.command"
 			config-ref="RabbitMQ_Config"
@@ -390,7 +381,6 @@ payload]]></ee:set-payload>
 			</otherwise>
 		</choice>
 
-		<!-- Publish Refund Reply back to Saga Orchestrator -->
 		<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish payment.refund.reply">
 			<amqp:routing-keys>
 				<amqp:routing-key value="#[vars.request.replyTo default 'payment.refund.reply']" />
@@ -425,11 +415,10 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- ==================== LOCAL REUSABLE RACE-CONDITION SUB-FLOW ==================== -->
 	<sub-flow name="payment-handle-duplicate-race-sub-flow">
 		<choice doc:name="Check Duplicate Key Race">
 			<when expression="#[contains((error.description default ''), 'Duplicate entry') or contains((error.description default ''), 'dedup_key')]">
-				<db:select config-ref="payment_Database_Config1" target="raceCheckResult" doc:name="Read winner response">
+				<db:select config-ref="payment_Database_config" target="raceCheckResult" doc:name="Read winner response">
 					<db:sql><![CDATA[SELECT result_payload FROM processed_commands WHERE dedup_key = :dedupKey]]></db:sql>
 					<db:input-parameters><![CDATA[#[{dedupKey: vars.dedupKey}]]]></db:input-parameters>
 				</db:select>
@@ -478,12 +467,11 @@ payload]]></ee:set-payload>
 		</choice>
 	</sub-flow>
 
-	<!-- ==================== CHARGE SUB-FLOW ==================== -->
 	<sub-flow name="payment-charge-Sub_Flow">
 		<set-variable variableName="paymentReply" value="#[null]" doc:name="Init paymentReply" />
 
 		<try doc:name="Payment Transaction Boundary" transactionalAction="ALWAYS_BEGIN" transactionType="LOCAL">
-			<db:select config-ref="payment_Database_Config1" target="existingCharge" doc:name="Check processed commands">
+			<db:select config-ref="payment_Database_config" target="existingCharge" doc:name="Check processed commands">
 				<db:sql><![CDATA[SELECT dedup_key, result_payload FROM processed_commands WHERE dedup_key = :dedupKey FOR UPDATE]]></db:sql>
 				<db:input-parameters><![CDATA[#[{dedupKey: vars.dedupKey}]]]></db:input-parameters>
 			</db:select>
@@ -491,7 +479,11 @@ payload]]></ee:set-payload>
 			<choice doc:name="Check Idempotency Hit">
 				<when expression="#[!isEmpty(vars.existingCharge default [])]">
 					<logger level="INFO" doc:name="Log Replay" message="#['[IDEMPOTENT_REPLAY] Replaying payment response for dedupKey: ' ++ vars.dedupKey]" />
-					<set-variable variableName="paymentReply" value="#[output application/java ---&#10;if (vars.existingCharge[0].result_payload is Object)&#10;vars.existingCharge[0].result_payload&#10;else&#10;read(vars.existingCharge[0].result_payload as String, 'application/json')]" doc:name="Replay saved response" />
+					<set-variable variableName="paymentReply" value="#[output application/java ---
+if (vars.existingCharge[0].result_payload is Object)
+vars.existingCharge[0].result_payload
+else
+read(vars.existingCharge[0].result_payload as String, 'application/json')]" doc:name="Replay saved response" />
 				</when>
 				<otherwise>
 					<choice doc:name="Simulate Gateway Approval">
@@ -515,7 +507,7 @@ payload]]></ee:set-payload>
 							<set-variable variableName="paymentId" value="#['PAY-' ++ (uuid()[0 to 7] as String)]" doc:name="Generate paymentId" />
 							<set-variable variableName="gatewayRef" value="#['GW-AUTH-' ++ (uuid()[0 to 11] as String)]" doc:name="Generate gatewayRef" />
 
-							<db:insert config-ref="payment_Database_Config1" doc:name="Insert payment transaction">
+							<db:insert config-ref="payment_Database_config" doc:name="Insert payment transaction">
 								<db:sql><![CDATA[INSERT INTO payment_transactions (payment_id, order_id, amount, currency, status, gateway_ref)
 VALUES (:paymentId, :orderId, :amount, :currency, 'CHARGED', :gatewayRef)]]></db:sql>
 								<db:input-parameters><![CDATA[#[{
@@ -548,7 +540,7 @@ VALUES (:paymentId, :orderId, :amount, :currency, 'CHARGED', :gatewayRef)]]></db
 						</otherwise>
 					</choice>
 
-					<db:insert config-ref="payment_Database_Config1" doc:name="Save Idempotent Command">
+					<db:insert config-ref="payment_Database_config" doc:name="Save Idempotent Command">
 						<db:sql><![CDATA[INSERT INTO processed_commands (dedup_key, step_id, command_type, result_payload, processed_at)
 VALUES (:dedupKey, :stepId, 'CHARGE', :resultPayload, CURRENT_TIMESTAMP)]]></db:sql>
 						<db:input-parameters><![CDATA[#[{
@@ -564,12 +556,11 @@ VALUES (:dedupKey, :stepId, 'CHARGE', :resultPayload, CURRENT_TIMESTAMP)]]></db:
 		<set-payload value="#[vars.paymentReply]" doc:name="Return paymentReply" />
 	</sub-flow>
 
-	<!-- ==================== REFUND SUB-FLOW ==================== -->
 	<sub-flow name="payment-refund-Sub_Flow">
 		<set-variable variableName="refundReply" value="#[null]" doc:name="Init refundReply" />
 
 		<try doc:name="Refund Transaction Boundary" transactionalAction="ALWAYS_BEGIN" transactionType="LOCAL">
-			<db:select config-ref="payment_Database_Config1" target="existingRefund" doc:name="Check processed commands">
+			<db:select config-ref="payment_Database_config" target="existingRefund" doc:name="Check processed commands">
 				<db:sql><![CDATA[SELECT dedup_key, result_payload FROM processed_commands WHERE dedup_key = :dedupKey FOR UPDATE]]></db:sql>
 				<db:input-parameters><![CDATA[#[{dedupKey: vars.dedupKey}]]]></db:input-parameters>
 			</db:select>
@@ -586,13 +577,13 @@ VALUES (:dedupKey, :stepId, 'CHARGE', :resultPayload, CURRENT_TIMESTAMP)]]></db:
 				<otherwise>
 					<choice doc:name="Lookup by Payment ID or Order ID">
 						<when expression="#[!isEmpty(vars.command.payload.paymentId default '')]">
-							<db:select config-ref="payment_Database_Config1" target="paymentRows" doc:name="Lock by PaymentId">
+							<db:select config-ref="payment_Database_config" target="paymentRows" doc:name="Lock by PaymentId">
 								<db:sql><![CDATA[SELECT payment_id, order_id, amount, currency, status, gateway_ref, refund_ref FROM payment_transactions WHERE payment_id = :paymentId FOR UPDATE]]></db:sql>
 								<db:input-parameters><![CDATA[#[{paymentId: vars.command.payload.paymentId}]]]></db:input-parameters>
 							</db:select>
 						</when>
 						<otherwise>
-							<db:select config-ref="payment_Database_Config1" target="paymentRows" doc:name="Lock by OrderId">
+							<db:select config-ref="payment_Database_config" target="paymentRows" doc:name="Lock by OrderId">
 								<db:sql><![CDATA[SELECT payment_id, order_id, amount, currency, status, gateway_ref, refund_ref FROM payment_transactions WHERE order_id = :orderId FOR UPDATE]]></db:sql>
 								<db:input-parameters><![CDATA[#[{orderId: vars.command.payload.orderId}]]]></db:input-parameters>
 							</db:select>
@@ -607,7 +598,7 @@ VALUES (:dedupKey, :stepId, 'CHARGE', :resultPayload, CURRENT_TIMESTAMP)]]></db:
 						<when expression="#[['CHARGED', 'AUTHORIZED'] contains (vars.paymentRows[0].status default '')]">
 							<set-variable variableName="refundRef" value="#['GW-REF-' ++ (uuid()[0 to 11] as String)]" doc:name="Generate refundRef" />
 
-							<db:update config-ref="payment_Database_Config1" target="updateResult" doc:name="Mark payment refunded">
+							<db:update config-ref="payment_Database_config" target="updateResult" doc:name="Mark payment refunded">
 								<db:sql><![CDATA[UPDATE payment_transactions
 SET status = 'REFUNDED',
     refund_ref = :refundRef,
@@ -665,7 +656,7 @@ WHERE payment_id = :paymentId
 						</otherwise>
 					</choice>
 
-					<db:insert config-ref="payment_Database_Config1" doc:name="Save Idempotent Refund Command">
+					<db:insert config-ref="payment_Database_config" doc:name="Save Idempotent Refund Command">
 						<db:sql><![CDATA[INSERT INTO processed_commands (dedup_key, step_id, command_type, result_payload, processed_at)
 VALUES (:dedupKey, :stepId, 'REFUND', :resultPayload, CURRENT_TIMESTAMP)]]></db:sql>
 						<db:input-parameters><![CDATA[#[{

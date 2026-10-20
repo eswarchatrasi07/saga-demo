@@ -6,7 +6,6 @@
 	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
 	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
 	xmlns:http="http://www.mulesoft.org/schema/mule/http"
-	xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
 	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
 	xsi:schemaLocation="
 		http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
@@ -14,36 +13,15 @@
 		http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
 		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
 		http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
-		http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
 		http://www.mulesoft.org/schema/mule/amqp http://www.mulesoft.org/schema/mule/amqp/current/mule-amqp.xsd">
 
-	<!-- ==================== GLOBAL CONFIGURATIONS ==================== -->
-	<!-- 1. Properties file loaded first -->
-	<configuration-properties doc:name="Configuration properties" file="config.yaml" />
-
-	<!-- 2. HTTP Listener Config on Port 8083 -->
-	<http:listener-config name="shipping-system-api-httpListenerConfig">
-		<http:listener-connection host="0.0.0.0" port="8083" />
-	</http:listener-config>
-
-	<!-- 3. APIKit Router Config -->
 	<apikit:config name="shipping-system-api-config"
 		api="shipping-system-api.raml"
 		outboundHeadersMapName="outboundHeaders"
 		httpStatusVarName="httpStatus" />
 
-	<!-- 4. Database Config for Shipping Service (Aiven MySQL) with Bounded Reconnection -->
-	<db:config name="shipping_Database_Config" doc:name="Database Config">
-		<db:my-sql-connection host="${db.host}" port="${db.port}" user="${db.user}" password="${db.password}" database="${database.shipping}">
-			<reconnection>
-				<reconnect count="3" frequency="2000" />
-			</reconnection>
-		</db:my-sql-connection>
-	</db:config>
-
-	<!-- ==================== MAIN ROUTER FLOW ==================== -->
 	<flow name="shipping-system-api-main">
-		<http:listener config-ref="shipping-system-api-httpListenerConfig" path="/api/v1/*">
+		<http:listener config-ref="Shared_HTTP_Listener_config" path="/shipping/api/v1/*">
 			<http:response statusCode="#[vars.httpStatus default 200]">
 				<http:headers>#[vars.outboundHeaders default {}]</http:headers>
 			</http:response>
@@ -57,7 +35,6 @@
 		<error-handler ref="global-error-handler" />
 	</flow>
 
-	<!-- ==================== POST /shipping/dispatch (HTTP REST) ==================== -->
 	<flow name="post:\shipping\dispatch:application\json:shipping-system-api-config">
 		<set-variable variableName="request" value="#[output application/java
 var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
@@ -155,7 +132,6 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- ==================== POST /shipping/cancel (HTTP REST) ==================== -->
 	<flow name="post:\shipping\cancel:application\json:shipping-system-api-config">
 		<set-variable variableName="request" value="#[output application/java
 var raw = if (payload is String or payload is Binary) read(payload, 'application/json') else (payload default {})
@@ -236,11 +212,6 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- ===================================================================== -->
-	<!-- AMQP EVENT-DRIVEN FLOWS (Saga Orchestration)                          -->
-	<!-- ===================================================================== -->
-
-	<!-- 1. AMQP Listener: Dispatch Shipping Command (Saga Step 3) -->
 	<flow name="shipping-dispatch-amqp-flow">
 		<amqp:listener doc:name="Listen shipping.dispatch.command"
 			config-ref="RabbitMQ_Config"
@@ -332,7 +303,6 @@ payload]]></ee:set-payload>
 			</otherwise>
 		</choice>
 
-		<!-- Publish Reply back to Saga Orchestrator -->
 		<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish shipping.dispatch.reply">
 			<amqp:routing-keys>
 				<amqp:routing-key value="#[vars.request.replyTo default 'shipping.dispatch.reply']" />
@@ -367,7 +337,6 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- 2. AMQP Listener: Cancel Shipping Command (Saga Step 3 Compensation) -->
 	<flow name="shipping-cancel-amqp-flow">
 		<amqp:listener doc:name="Listen shipping.cancel.command"
 			config-ref="RabbitMQ_Config"
@@ -441,7 +410,6 @@ payload]]></ee:set-payload>
 			</otherwise>
 		</choice>
 
-		<!-- Publish Cancel Reply back to Saga Orchestrator -->
 		<amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish shipping.cancel.reply">
 			<amqp:routing-keys>
 				<amqp:routing-key value="#[vars.request.replyTo default 'shipping.cancel.reply']" />
@@ -476,7 +444,6 @@ payload]]></ee:set-payload>
 		</error-handler>
 	</flow>
 
-	<!-- ==================== LOCAL REUSABLE RACE-CONDITION SUB-FLOW ==================== -->
 	<sub-flow name="shipping-handle-duplicate-race-sub-flow">
 		<choice doc:name="Check Duplicate Key Race">
 			<when expression="#[contains((error.description default ''), 'Duplicate entry') or contains((error.description default ''), 'dedup_key')]">
@@ -529,7 +496,6 @@ payload]]></ee:set-payload>
 		</choice>
 	</sub-flow>
 
-	<!-- ==================== DISPATCH SUB-FLOW ==================== -->
 	<sub-flow name="shipping-dispatch-Sub_Flow">
 		<set-variable variableName="shippingReply" value="#[null]" doc:name="Init shippingReply" />
 
@@ -632,7 +598,6 @@ VALUES (:dedupKey, :stepId, 'DISPATCH', :resultPayload, CURRENT_TIMESTAMP)]]></d
 		<set-payload value="#[vars.shippingReply]" doc:name="Return shippingReply" />
 	</sub-flow>
 
-	<!-- ==================== CANCEL SUB-FLOW ==================== -->
 	<sub-flow name="shipping-cancel-Sub_Flow">
 		<set-variable variableName="cancelReply" value="#[null]" doc:name="Init cancelReply" />
 

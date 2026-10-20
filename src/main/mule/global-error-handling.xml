@@ -9,16 +9,9 @@
 		http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
 		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
 
-	<!-- Application-wide default error handler binding -->
 	<configuration defaultErrorHandler-ref="global-error-handler" />
 
-	<!-- ===================================================================== -->
-	<!-- GLOBAL ERROR HANDLER                                                 -->
-	<!-- Reusable across Inventory, Payment, and Shipping System APIs          -->
-	<!-- ===================================================================== -->
 	<error-handler name="global-error-handler">
-
-		<!-- 1. APIKit Router Errors (Standard Module Errors) -->
 		<on-error-propagate type="APIKIT:BAD_REQUEST" logException="true">
 			<set-variable variableName="httpStatus" value="400" doc:name="Set Status 400" />
 			<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Prepare Error Response" />
@@ -49,35 +42,27 @@
 			<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Prepare Error Response" />
 		</on-error-propagate>
 
-		<!-- 2. Transient Technical Errors (Database Connectivity, Retry Exhausted) -->
 		<on-error-propagate type="DB:CONNECTIVITY, DB:RETRY_EXHAUSTED, CONNECTIVITY" logException="true">
 			<set-variable variableName="httpStatus" value="503" doc:name="Set Status 503" />
 			<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Prepare Error Response" />
 		</on-error-propagate>
 
-		<!-- 3. Non-Transient Database Errors (SQL Syntax, Query Execution Constraints) -->
 		<on-error-propagate type="DB:BAD_SQL_SYNTAX, DB:QUERY_EXECUTION" logException="true">
 			<set-variable variableName="httpStatus" value="500" doc:name="Set Status 500" />
 			<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Prepare Error Response" />
 		</on-error-propagate>
 
-		<!-- 4. Business Errors & Catch-All (Classified Dynamically in Sub-flow) -->
 		<on-error-propagate type="ANY" logException="true">
 			<flow-ref name="global-prepare-error-response-sub-flow" doc:name="Prepare Error Response" />
 		</on-error-propagate>
-
 	</error-handler>
 
-	<!-- ===================================================================== -->
-	<!-- REUSABLE SUB-FLOW: PREPARE ERROR RESPONSE & SAFE AUDIT LOGGING        -->
-	<!-- ===================================================================== -->
 	<sub-flow name="global-prepare-error-response-sub-flow">
 		<ee:transform doc:name="Format Standardized Saga Error Payload">
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
 output application/json
 
-// 1. Resolve Correlation and Business Identifiers safely
 var resolvedCorrelationId = vars.request.correlationId default vars.command.correlationId default correlationId
 var resolvedSagaId = vars.request.sagaId default vars.command.sagaId default null
 var resolvedStepId = vars.request.stepId default vars.command.stepId default null
@@ -87,7 +72,6 @@ var resolvedStepName = vars.request.stepName default vars.command.stepName defau
 )
 var resolvedAttempt = vars.request.attempt default vars.command.attempt default 1
 
-// 2. Classify Failure Type
 var errorNamespace = error.errorType.namespace default ''
 var errorIdentifier = error.errorType.identifier default ''
 var isBusiness = (
@@ -100,14 +84,12 @@ var isBusiness = (
 )
 var failureType = if (isBusiness) 'BUSINESS' else 'TECHNICAL'
 
-// 3. Determine Retryability (Only transient technical failures are retryable)
 var isRetryable = (
     (errorNamespace == 'DB' and (['CONNECTIVITY', 'RETRY_EXHAUSTED'] contains errorIdentifier)) or
     errorIdentifier == 'CONNECTIVITY' or
     errorNamespace == 'CONNECTIVITY'
 )
 
-// 4. Determine Standard Failure Code
 var failureCode = if (errorNamespace == 'APIKIT') (
     if (errorIdentifier == 'BAD_REQUEST') 'INVALID_REQUEST'
     else if (errorIdentifier == 'NOT_FOUND') 'RESOURCE_NOT_FOUND'
@@ -123,7 +105,6 @@ var failureCode = if (errorNamespace == 'APIKIT') (
     errorIdentifier default 'INTERNAL_ERROR'
 )
 
-// 5. Sanitize Failure Message (Never leak SQL syntax, passwords, or card tokens)
 var rawDescription = error.description default 'An error occurred during transaction processing'
 var failureMessage = if (isRetryable)
     'Transient connectivity failure to database or external service'
@@ -197,7 +178,6 @@ else 500]]></ee:set-variable>
 			</ee:variables>
 		</ee:transform>
 
-		<!-- Standardized Safe Audit Logger: No Card Tokens or Credentials -->
 		<logger level="ERROR" doc:name="Safe Audit Log Event"
 			message="#[%dw 2.0
 output application/json
