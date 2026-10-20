@@ -72,14 +72,7 @@ raw ++ {
 }]" doc:name="Save charge request" />
 
 		<choice doc:name="Validate Charge Payload">
-			<when expression="#[
-				isEmpty(vars.request.correlationId default '') or
-				isEmpty(vars.request.sagaId default '') or
-				isEmpty(vars.request.stepId default '') or
-				isEmpty(vars.request.orderId default '') or
-				isEmpty(vars.request.cardToken default '') or
-				(vars.request.amount == null or not (vars.request.amount is Number) or vars.request.amount &lt;= 0)
-			]">
+			<when expression="#[isEmpty(vars.request.correlationId default '') or&#10;				isEmpty(vars.request.sagaId default '') or&#10;				isEmpty(vars.request.stepId default '') or&#10;				isEmpty(vars.request.orderId default '') or&#10;				isEmpty(vars.request.cardToken default '') or&#10;				(vars.request.amount == null or not (vars.request.amount is Number) or vars.request.amount &lt;= 0)]">
 				<set-variable variableName="httpStatus" value="400" doc:name="Status 400" />
 				<set-payload value="#[output application/java ---
 {
@@ -116,12 +109,7 @@ raw ++ {
 
 				<flow-ref doc:name="Invoke Charge Sub-Flow" name="payment-charge-Sub_Flow" />
 
-				<set-variable variableName="httpStatus" value="#[
-					if (payload.outcome == 'SUCCESS') 200
-					else if (payload.failureCode == 'PAYMENT_DECLINED' or payload.failureCode == 'COMMAND_IN_PROGRESS') 409
-					else if (payload.retryable default false) 503
-					else 400
-				]" doc:name="Set httpStatus" />
+				<set-variable variableName="httpStatus" value="#[if (payload.outcome == 'SUCCESS') 200&#10;					else if (payload.failureCode == 'PAYMENT_DECLINED' or payload.failureCode == 'COMMAND_IN_PROGRESS') 409&#10;					else if (payload.retryable default false) 503&#10;					else 400]" doc:name="Set httpStatus" />
 			</otherwise>
 		</choice>
 
@@ -196,13 +184,7 @@ raw ++ {
 
 				<flow-ref doc:name="Invoke Refund Sub-Flow" name="payment-refund-Sub_Flow" />
 
-				<set-variable variableName="httpStatus" value="#[
-					if (payload.outcome == 'SUCCESS') 200
-					else if (payload.failureCode == 'PAYMENT_NOT_FOUND') 404
-					else if (payload.failureCode == 'INVALID_PAYMENT_STATE' or payload.failureCode == 'COMMAND_IN_PROGRESS') 409
-					else if (payload.retryable default false) 503
-					else 400
-				]" doc:name="Set status from reply" />
+				<set-variable variableName="httpStatus" value="#[if (payload.outcome == 'SUCCESS') 200&#10;					else if (payload.failureCode == 'PAYMENT_NOT_FOUND') 404&#10;					else if (payload.failureCode == 'INVALID_PAYMENT_STATE' or payload.failureCode == 'COMMAND_IN_PROGRESS') 409&#10;					else if (payload.retryable default false) 503&#10;					else 400]" doc:name="Set status from reply" />
 			</otherwise>
 		</choice>
 
@@ -252,14 +234,7 @@ raw ++ {
 }]" doc:name="Save charge request" />
 
 		<choice doc:name="Validate Charge Payload">
-			<when expression="#[
-				isEmpty(vars.request.correlationId default '') or
-				isEmpty(vars.request.sagaId default '') or
-				isEmpty(vars.request.stepId default '') or
-				isEmpty(vars.request.orderId default '') or
-				isEmpty(vars.request.cardToken default '') or
-				(vars.request.amount == null or not (vars.request.amount is Number) or vars.request.amount &lt;= 0)
-			]">
+			<when expression="#[isEmpty(vars.request.correlationId default '') or&#10;isEmpty(vars.request.sagaId default '') or&#10;isEmpty(vars.request.stepId default '') or&#10;isEmpty(vars.request.orderId default '') or&#10;isEmpty(vars.request.cardToken default '') or&#10;(vars.request.amount == null or&#10;	not (vars.request.amount is Number) or&#10;	 vars.request.amount &lt;= 0&#10;)]">
 				<set-payload value="#[output application/json ---
 {
 	correlationId: vars.request.correlationId default null,

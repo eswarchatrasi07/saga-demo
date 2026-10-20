@@ -1,0 +1,248 @@
+#%RAML 1.0
+title: Order Experience API
+version: v1
+mediaType: [ application/json ]
+protocols: [ HTTP, HTTPS ]
+baseUri: http://localhost:8085/api/v1
+
+documentation:
+  - title: Overview
+    content: |
+      Experience API layer for customer-facing order placement and tracking.
+      Validates client payloads and forwards requests to the Saga Process Orchestrator API (Port 8084).
+
+types:
+  OrderItem:
+    type: object
+    properties:
+      sku:
+        type: string
+        required: true
+        example: "SKU-TSHIRT-BLK-M"
+      quantity:
+        type: integer
+        minimum: 1
+        required: true
+        example: 2
+      unitPrice:
+        type: number
+        minimum: 0.01
+        required: true
+        example: 1499.00
+
+  PaymentDetails:
+    type: object
+    properties:
+      method:
+        type: string
+        enum: [ CARD, UPI, WALLET ]
+        required: true
+        example: "CARD"
+      cardToken:
+        type: string
+        required: true
+        example: "TKN-4d9a77e1c0"
+
+  ShippingAddress:
+    type: object
+    properties:
+      addressLine1:
+        type: string
+        required: true
+        example: "21 Anna Salai"
+      city:
+        type: string
+        required: true
+        example: "Chennai"
+      state:
+        type: string
+        required: true
+        example: "Tamil Nadu"
+      postalCode:
+        type: string
+        required: true
+        example: "600002"
+      country:
+        type: string
+        required: true
+        example: "India"
+      serviceLevel:
+        type: string
+        enum: [ STANDARD, EXPRESS ]
+        required: false
+        default: "STANDARD"
+
+  OrderFulfilmentRequest:
+    type: object
+    properties:
+      orderId:
+        type: string
+        required: true
+        example: "ORD-2026-1001"
+      customerId:
+        type: string
+        required: true
+        example: "CUST-501"
+      currency:
+        type: string
+        minLength: 3
+        maxLength: 3
+        default: "INR"
+        example: "INR"
+      totalAmount:
+        type: number
+        minimum: 0.01
+        required: true
+        example: 3797.00
+      items:
+        type: OrderItem[]
+        minItems: 1
+        required: true
+      payment:
+        type: PaymentDetails
+        required: true
+      shipping:
+        type: ShippingAddress
+        required: true
+
+  InitiationResponse:
+    type: object
+    properties:
+      sagaId: string
+      orderId: string
+      sagaState: string
+      statusUrl: string
+      correlationId: string
+
+  SagaStepStatus:
+    type: object
+    properties:
+      stepSequence: integer
+      stepName: string
+      stepState: string
+      attemptCount: integer
+      compensationState: string
+      failureCode?: string
+      startedAt?: string
+      completedAt?: string
+      compensatedAt?: string
+
+  SagaStatusResponse:
+    type: object
+    properties:
+      sagaId: string
+      orderId: string
+      sagaState: string
+      correlationId: string
+      failureCode?: string
+      failureMessage?: string
+      startedAt: string
+      completedAt?: string
+      steps: SagaStepStatus[]
+
+  ErrorResponse:
+    type: object
+    properties:
+      errorCode: string
+      message: string
+      sagaId?: string
+      orderId?: string
+      sagaState?: string
+      failureCode?: string
+      failureMessage?: string
+      correlationId?: string
+      timestamp?: datetime | string
+      targetService?: string
+      steps?: SagaStepStatus[]
+
+/sagas:
+  /order-fulfilment:
+    post:
+      description: Accepts order fulfilment requests from client channels, validates schema, and forwards to the Saga Process API
+      headers:
+        X-Correlation-ID?:
+          type: string
+          required: false
+          description: Client-provided correlation identifier for end-to-end tracing
+          example: "c794358a-3606-4447-9755-901d812d1b82"
+      body:
+        application/json:
+          type: OrderFulfilmentRequest
+      responses:
+        200:
+          description: Saga executed and order fulfilled successfully
+          body:
+            application/json:
+              type: any
+        202:
+          description: Order accepted and scheduled for asynchronous saga execution
+          body:
+            application/json:
+              type: InitiationResponse
+        400:
+          description: Malformed JSON or schema constraint validation failure
+          body:
+            application/json:
+              type: ErrorResponse
+        409:
+          description: Duplicate order ID or saga conflict
+          body:
+            application/json:
+              type: any
+        500:
+          description: Internal processing failure in downstream service
+          body:
+            application/json:
+              type: ErrorResponse
+        502:
+          description: Bad Gateway - Saga Process API is down or connection refused
+          body:
+            application/json:
+              type: ErrorResponse
+        504:
+          description: Gateway Timeout - Saga Process API timed out waiting for response
+          body:
+            application/json:
+              type: ErrorResponse
+
+  /{sagaId}:
+    uriParameters:
+      sagaId:
+        type: string
+        required: true
+        description: Unique Saga instance identifier generated during order creation
+        example: "SAGA-2026-0000771"
+    get:
+      description: Retrieves durable saga status and executing steps by sagaId
+      headers:
+        X-Correlation-ID?:
+          type: string
+          required: false
+          description: Client-provided correlation identifier
+          example: "c794358a-3606-4447-9755-901d812d1b82"
+      responses:
+        200:
+          description: Current saga status and execution history
+          body:
+            application/json:
+              type: SagaStatusResponse
+        404:
+          description: Saga instance not found
+          body:
+            application/json:
+              type: ErrorResponse
+        500:
+          description: Internal error retrieving saga status
+          body:
+            application/json:
+              type: ErrorResponse
+        502:
+          description: Bad Gateway - Saga Process API is down or connection refused
+          body:
+            application/json:
+              type: ErrorResponse
+        504:
+          description: Gateway Timeout - Saga Process API timed out
+          body:
+            application/json:
+              type: ErrorResponse
