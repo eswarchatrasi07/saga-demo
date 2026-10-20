@@ -169,7 +169,7 @@ VALUES (:sagaId, 'ORDER_FULFILMENT', :orderId, :customerId, :requestPayload, 'ST
                 <choice doc:name="Check Outcome Status">
                     <!-- 1. SAGA COMPLETED SUCCESSFULLY (200 OK) -->
                     <when expression="#[!isEmpty(vars.terminalSaga default []) and vars.terminalSaga[0].saga_state == 'COMPLETED']">
-                        <set-variable variableName="httpStatus" value="200" doc:name="Status 200 OK" />
+                        <set-variable variableName="httpStatus" value="202" doc:name="Status 202 OK" />
                         <db:select config-ref="Saga_Database_Config" target="stepRows" doc:name="Select Saga Steps">
                             <db:sql><![CDATA[SELECT step_sequence, step_name, step_state, attempt_count, compensation_state, failure_code, command_sent_at, reply_received_at, compensated_at FROM saga_steps WHERE saga_id = :sagaId ORDER BY step_sequence ASC]]></db:sql>
                             <db:input-parameters><![CDATA[#[{ sagaId: vars.sagaId }]]]></db:input-parameters>

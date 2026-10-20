@@ -178,12 +178,7 @@ var badItem = ((vars.request.items default []) filter ((item) -&gt;
     }
 }]" doc:name="Build reserve command" />
 				<flow-ref doc:name="Reserve sub-flow" name="inventory-reserver-Sub_Flow" />
-				<set-variable variableName="httpStatus" value="#[if (payload.outcome == 'SUCCESS') 200
-else if (payload.failureCode == 'UNKNOWN_SKU' or payload.errorCode == 'UNKNOWN_SKU') 404
-else if (['INVALID_COMMAND', 'INVALID_ITEM', 'INVALID_ITEMS', 'INVALID_REQUEST', 'INVALID_QUANTITY'] contains (payload.failureCode default payload.errorCode default '')) 400
-else if (['INSUFFICIENT_STOCK', 'INSUFFICIENT_QUANTITY', 'COMMAND_IN_PROGRESS'] contains (payload.failureCode default payload.errorCode default '')) 409
-else if (payload.retryable default false) 503
-else 500]" doc:name="Set status from reply" />
+				<set-variable variableName="httpStatus" value="#[if (payload.outcome == 'SUCCESS') 202&#10;else if (payload.failureCode == 'UNKNOWN_SKU' or payload.errorCode == 'UNKNOWN_SKU') 404&#10;else if (['INVALID_COMMAND', 'INVALID_ITEM', 'INVALID_ITEMS', 'INVALID_REQUEST', 'INVALID_QUANTITY'] contains (payload.failureCode default payload.errorCode default '')) 400&#10;else if (['INSUFFICIENT_STOCK', 'INSUFFICIENT_QUANTITY', 'COMMAND_IN_PROGRESS'] contains (payload.failureCode default payload.errorCode default '')) 409&#10;else if (payload.retryable default false) 503&#10;else 500]" doc:name="Set status from reply" />
 			</otherwise>
 		</choice>
 		<ee:transform doc:name="Reply to JSON">
@@ -264,12 +259,7 @@ raw ++ {
 
 				<flow-ref doc:name="Release sub-flow" name="inventory-release-Sub_Flow" />
 
-				<set-variable variableName="httpStatus" value="#[if (payload.outcome == 'SUCCESS') 200
-else if (payload.failureCode == 'RESERVATION_NOT_FOUND') 404
-else if (['COMMAND_IN_PROGRESS', 'INVALID_RESERVATION_STATE', 'STOCK_RESTORE_FAILED', 'RESERVATION_UPDATE_FAILED'] contains (payload.failureCode default '')) 409
-else if (['INVALID_COMMAND', 'INVALID_REQUEST'] contains (payload.failureCode default '')) 400
-else if (payload.retryable default false) 503
-else 500]" doc:name="Set status from reply" />
+				<set-variable variableName="httpStatus" value="#[if (payload.outcome == 'SUCCESS') 202&#10;else if (payload.failureCode == 'RESERVATION_NOT_FOUND') 404&#10;else if (['COMMAND_IN_PROGRESS', 'INVALID_RESERVATION_STATE', 'STOCK_RESTORE_FAILED', 'RESERVATION_UPDATE_FAILED'] contains (payload.failureCode default '')) 409&#10;else if (['INVALID_COMMAND', 'INVALID_REQUEST'] contains (payload.failureCode default '')) 400&#10;else if (payload.retryable default false) 503&#10;else 500]" doc:name="Set status from reply" />
 			</otherwise>
 		</choice>
 
@@ -377,6 +367,7 @@ var badItem = ((vars.request.items default []) filter ((item) -&gt;
     }
 }]" doc:name="Build reserve command" />
 				<flow-ref doc:name="Reserve sub-flow" name="inventory-reserver-Sub_Flow" />
+				<set-variable value="#[if (payload.outcome == 'SUCCESS') 202&#10;else if (payload.failureCode == 'RESERVATION_NOT_FOUND') 404&#10;else if (['COMMAND_IN_PROGRESS', 'INVALID_RESERVATION_STATE', 'STOCK_RESTORE_FAILED', 'RESERVATION_UPDATE_FAILED'] contains (payload.failureCode default '')) 409&#10;else if (['INVALID_COMMAND', 'INVALID_REQUEST'] contains (payload.failureCode default '')) 400&#10;else if (payload.retryable default false) 503&#10;else 500]" doc:name="Set Variable" doc:id="34f0d6e9-73ac-4f77-b79c-18656dd18ba6" variableName="httpStatus"/>
 				<ee:transform doc:name="Reply to JSON">
 					<ee:message>
 						<ee:set-payload><![CDATA[%dw 2.0
@@ -385,7 +376,8 @@ output application/json
 payload]]></ee:set-payload>
 					</ee:message>
 				</ee:transform>
-			</otherwise>
+			
+</otherwise>
 		</choice>
 
 		<!-- Publish Success or Handled Business Failure Reply back to Saga Orchestrator -->
